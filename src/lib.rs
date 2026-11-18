@@ -34,6 +34,8 @@ mod iter;
 #[macro_use] mod macros;
 mod simd;
 
+pub mod framing;
+
 #[doc(hidden)]
 // Expose some internal functions so we can bench them individually
 // WARNING: Exported for internal benchmarks, not fit for public consumption
@@ -555,6 +557,19 @@ impl<'h, 'b> Request<'h, 'b> {
     pub fn parse(&mut self, buf: &'b [u8]) -> Result<usize> {
         self.parse_with_config(buf, &Default::default())
     }
+
+    /// Determine the unambiguous body framing of this parsed request.
+    ///
+    /// This does not mutate the request or its raw headers: duplicate and
+    /// otherwise unusual header lines stay available through
+    /// [`Request::headers`]. Ambiguous framing combinations (for example both
+    /// `Content-Length` and `Transfer-Encoding`, duplicate or malformed
+    /// `Content-Length`, or obsolete line folding in a framing header) fail
+    /// closed with a [`framing::FramingError`] and should be rejected instead
+    /// of forwarded.
+    pub fn framing(&self) -> framing::Result<framing::Framing> {
+        framing::determine_framing(self.headers, self.version == Some(1))
+    }
 }
 
 #[inline]
@@ -635,6 +650,19 @@ impl<'h, 'b> Response<'h, 'b> {
     /// on a growing buffer without size/time limits; CPU usage may grow fast.
     pub fn parse(&mut self, buf: &'b [u8]) -> Result<usize> {
         self.parse_with_config(buf, &ParserConfig::default())
+    }
+
+    /// Determine the unambiguous body framing of this parsed response.
+    ///
+    /// This does not mutate the response or its raw headers: duplicate and
+    /// otherwise unusual header lines stay available through
+    /// [`Response::headers`]. Ambiguous framing combinations (for example both
+    /// `Content-Length` and `Transfer-Encoding`, duplicate or malformed
+    /// `Content-Length`, or obsolete line folding in a framing header) fail
+    /// closed with a [`framing::FramingError`] and should be rejected instead
+    /// of forwarded.
+    pub fn framing(&self) -> framing::Result<framing::Framing> {
+        framing::determine_framing(self.headers, self.version == Some(1))
     }
 
     fn parse_with_config(&mut self, buf: &'b [u8], config: &ParserConfig) -> Result<usize> {
