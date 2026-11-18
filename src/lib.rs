@@ -431,9 +431,11 @@ impl ParserConfig {
 
 /// A parsed Request.
 ///
-/// The optional values will be `None` if a parse was not complete, and did not
-/// parse the associated property. This allows you to inspect the parts that
-/// could be parsed, before reading more, in case you wish to exit early.
+/// The optional values are only committed once a parse completes
+/// successfully. Incremental parsing is staged internally, so a
+/// `Status::Partial` or an error leaves any previously committed values
+/// untouched and never exposes half-parsed fields. When more data has been
+/// read, parse again from the start of the request head.
 ///
 /// # Example
 ///
@@ -443,15 +445,8 @@ impl ParserConfig {
 /// let mut req = httparse::Request::new(&mut headers);
 /// let res = req.parse(buf).unwrap();
 /// if res.is_partial() {
-///     match req.path {
-///         Some(ref path) => {
-///             // check router for path.
-///             // /404 doesn't exist? we could stop parsing
-///         },
-///         None => {
-///             // must read more and parse again
-///         }
-///     }
+///     // Nothing is committed yet; read more and parse again.
+///     assert!(req.path.is_none());
 /// }
 /// ```
 #[derive(Debug, Eq, PartialEq)]
@@ -488,15 +483,14 @@ impl<'h, 'b> Request<'h, 'b> {
         let mut bytes = Bytes::new(buf);
         complete!(skip_empty_lines(&mut bytes));
         let method = complete!(parse_method(&mut bytes));
-        self.method = Some(method);
         if config.allow_multiple_spaces_in_request_line_delimiters {
             complete!(skip_spaces(&mut bytes));
         }
-        self.path = Some(complete!(parse_uri(&mut bytes)));
+        let path = complete!(parse_uri(&mut bytes));
         if config.allow_multiple_spaces_in_request_line_delimiters {
             complete!(skip_spaces(&mut bytes));
         }
-        self.version = Some(complete!(parse_version(&mut bytes)));
+        let version = complete!(parse_version(&mut bytes));
         newline!(bytes);
 
         let len = orig_len - bytes.len();
@@ -510,6 +504,9 @@ impl<'h, 'b> Request<'h, 'b> {
                 ignore_invalid_headers: config.ignore_invalid_headers_in_requests
             },
         ));
+        self.method = Some(method);
+        self.path = Some(path);
+        self.version = Some(version);
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
 
@@ -666,12 +663,12 @@ impl<'h, 'b> Response<'h, 'b> {
         let mut bytes = Bytes::new(buf);
 
         complete!(skip_empty_lines(&mut bytes));
-        self.version = Some(complete!(parse_version(&mut bytes)));
+        let version = complete!(parse_version(&mut bytes));
         space!(bytes or Error::Version);
         if config.allow_multiple_spaces_in_response_status_delimiters {
             complete!(skip_spaces(&mut bytes));
         }
-        self.code = Some(complete!(parse_code(&mut bytes)));
+        let code = complete!(parse_code(&mut bytes));
 
         // RFC7230 says there must be 'SP' and then reason-phrase, but admits
         // its only for legacy reasons. With the reason-phrase completely
@@ -682,25 +679,25 @@ impl<'h, 'b> Response<'h, 'b> {
         // So, a SP means parse a reason-phrase.
         // A newline means go to headers.
         // Anything else we'll say is a malformed status.
-        match next!(bytes) {
+        let reason = match next!(bytes) {
             b' ' => {
                 if config.allow_multiple_spaces_in_response_status_delimiters {
                     complete!(skip_spaces(&mut bytes));
                 }
                 bytes.slice();
-                self.reason = Some(complete!(parse_reason(&mut bytes)));
+                complete!(parse_reason(&mut bytes))
             },
             b'\r' => {
                 expect!(bytes.next() == b'\n' => Err(Error::Status));
                 bytes.slice();
-                self.reason = Some("");
+                ""
             },
             b'\n' => {
                 bytes.slice();
-                self.reason = Some("");
+                ""
             }
             _ => return Err(Error::Status),
-        }
+        };
 
 
         let len = orig_len - bytes.len();
@@ -714,6 +711,9 @@ impl<'h, 'b> Response<'h, 'b> {
                 ignore_invalid_headers: config.ignore_invalid_headers_in_responses
             }
         ));
+        self.version = Some(version);
+        self.code = Some(code);
+        self.reason = Some(reason);
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
         Ok(Status::Complete(len + headers_len))
@@ -1545,16 +1545,14 @@ mod tests {
     }
 
     req! {
-        test_request_partial_parses_headers_as_much_as_it_can,
+        test_request_partial_does_not_commit_fields,
         b"GET / HTTP/1.1\r\nHost: yolo\r\n",
         Ok(crate::Status::Partial),
         |req| {
-            assert_eq!(req.method.unwrap(), "GET");
-            assert_eq!(req.path.unwrap(), "/");
-            assert_eq!(req.version.unwrap(), 1);
+            assert_eq!(req.method, None);
+            assert_eq!(req.path, None);
+            assert_eq!(req.version, None);
             assert_eq!(req.headers.len(), NUM_OF_HEADERS); // doesn't slice since not Complete
-            assert_eq!(req.headers[0].name, "Host");
-            assert_eq!(req.headers[0].value, b"yolo");
         }
     }
 
@@ -1746,16 +1744,14 @@ mod tests {
     }
 
     res! {
-        test_response_partial_parses_headers_as_much_as_it_can,
+        test_response_partial_does_not_commit_fields,
         b"HTTP/1.1 200 OK\r\nServer: yolo\r\n",
         Ok(crate::Status::Partial),
         |res| {
-            assert_eq!(res.version.unwrap(), 1);
-            assert_eq!(res.code.unwrap(), 200);
-            assert_eq!(res.reason.unwrap(), "OK");
+            assert_eq!(res.version, None);
+            assert_eq!(res.code, None);
+            assert_eq!(res.reason, None);
             assert_eq!(res.headers.len(), NUM_OF_HEADERS); // doesn't slice since not Complete
-            assert_eq!(res.headers[0].name, "Server");
-            assert_eq!(res.headers[0].value, b"yolo");
         }
     }
 
@@ -1793,7 +1789,88 @@ mod tests {
                  Portion which failed: '{seg}' (below {i})",
                 seg = &req_str[..i]
             );
+            // A partial parse must not commit any staged fields, so a
+            // reused Request only ever exposes fully parsed results.
+            assert_eq!(req.method, None, "method committed at {i}");
+            assert_eq!(req.path, None, "path committed at {i}");
+            assert_eq!(req.version, None, "version committed at {i}");
         }
+        // Once the full head is available, the staged fields are committed.
+        let status = req.parse(req_str.as_bytes());
+        assert_eq!(status, Ok(Status::Complete(req_str.len())));
+        assert_eq!(req.method, Some("GET"));
+        assert_eq!(req.path, Some("/"));
+        assert_eq!(req.version, Some(1));
+        assert_eq!(req.headers.len(), 0);
+    }
+
+    /// Feed a request one byte at a time into a reused `Request`: only the
+    /// final, complete parse may expose fields.
+    #[test]
+    fn segmented_request_commits_fields_once() {
+        const REQ: &[u8] = b"GET /seg HTTP/1.1\r\nHost: yolo\r\n\r\n";
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+        for len in 1..REQ.len() {
+            assert_eq!(
+                req.parse(&REQ[..len]),
+                Ok(Status::Partial),
+                "prefix of {len} bytes should be partial"
+            );
+            assert_eq!(req.method, None, "method committed at {len}");
+            assert_eq!(req.path, None, "path committed at {len}");
+            assert_eq!(req.version, None, "version committed at {len}");
+        }
+        assert_eq!(req.parse(REQ), Ok(Status::Complete(REQ.len())));
+        assert_eq!(req.method, Some("GET"));
+        assert_eq!(req.path, Some("/seg"));
+        assert_eq!(req.version, Some(1));
+        assert_eq!(req.headers.len(), 1);
+        assert_eq!(req.headers[0].name, "Host");
+        assert_eq!(req.headers[0].value, b"yolo");
+    }
+
+    /// Feed a response one byte at a time into a reused `Response`: only the
+    /// final, complete parse may expose fields.
+    #[test]
+    fn segmented_response_commits_fields_once() {
+        const RES: &[u8] = b"HTTP/1.1 200 OK\r\nServer: yolo\r\n\r\n";
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut res = Response::new(&mut headers[..]);
+        for len in 1..RES.len() {
+            assert_eq!(
+                res.parse(&RES[..len]),
+                Ok(Status::Partial),
+                "prefix of {len} bytes should be partial"
+            );
+            assert_eq!(res.version, None, "version committed at {len}");
+            assert_eq!(res.code, None, "code committed at {len}");
+            assert_eq!(res.reason, None, "reason committed at {len}");
+        }
+        assert_eq!(res.parse(RES), Ok(Status::Complete(RES.len())));
+        assert_eq!(res.version, Some(1));
+        assert_eq!(res.code, Some(200));
+        assert_eq!(res.reason, Some("OK"));
+        assert_eq!(res.headers.len(), 1);
+        assert_eq!(res.headers[0].name, "Server");
+        assert_eq!(res.headers[0].value, b"yolo");
+    }
+
+    /// An error must not leave staged fields behind for the next attempt.
+    #[test]
+    fn error_does_not_pollute_next_attempt() {
+        const BAD: &[u8] = b"GET / HTTP/1!";
+        const REQ: &[u8] = b"POST /next HTTP/1.0\r\n\r\n";
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+        assert_eq!(req.parse(BAD), Err(Error::Version));
+        assert_eq!(req.method, None);
+        assert_eq!(req.path, None);
+        assert_eq!(req.version, None);
+        assert_eq!(req.parse(REQ), Ok(Status::Complete(REQ.len())));
+        assert_eq!(req.method, Some("POST"));
+        assert_eq!(req.path, Some("/next"));
+        assert_eq!(req.version, Some(0));
     }
 
     static RESPONSE_WITH_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON: &[u8] =
