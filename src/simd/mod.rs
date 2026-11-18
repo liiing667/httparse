@@ -98,9 +98,11 @@ mod sse42_compile_time {
         super::swar::match_header_name_vectored(b);
     }
 
-    #[inline(always)]
-    pub fn match_uri_vectored(b: &mut crate::iter::Bytes<'_>) {
-        unsafe { super::sse42::match_uri_vectored(b) }
+    pub fn match_uri_vectored(
+        b: &mut crate::iter::Bytes<'_>,
+        policy: crate::RequestLinePolicy,
+    ) {
+        unsafe { super::sse42::match_uri_vectored(b, policy) }
     }
 
     #[inline(always)]
@@ -134,9 +136,11 @@ mod avx2_compile_time {
         super::swar::match_header_name_vectored(b);
     }
 
-    #[inline(always)]
-    pub fn match_uri_vectored(b: &mut crate::iter::Bytes<'_>) {
-        unsafe { super::avx2::match_uri_vectored(b) }
+    pub fn match_uri_vectored(
+        b: &mut crate::iter::Bytes<'_>,
+        policy: crate::RequestLinePolicy,
+    ) {
+        unsafe { super::avx2::match_uri_vectored(b, policy) }
     }
 
     #[inline(always)]

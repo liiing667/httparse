@@ -63,16 +63,61 @@ fn is_method_token(b: u8) -> bool {
     }
 }
 
-// char codes to accept URI string.
-// i.e. b'!' <= char and char != 127
-// TODO: Make a stricter checking for URI string?
-static URI_MAP: [bool; 256] = byte_map!(
+// Char codes accepted in a request target.
+//
+// The strict table only accepts visible ASCII (`VCHAR` minus DEL, i.e.
+// `%x21-7E`). This is the grammar every HTTP/1.x request target is
+// supposed to use: any other byte has to be percent-encoded, so a bare
+// control byte, DEL or high byte is ambiguous and is rejected instead of
+// being silently passed through.
+//
+// The permissive table additionally accepts `obs-text` (`%x80-FF`) for
+// deployments that deliberately keep the historical behavior. Even in that
+// mode the bytes are only exposed through the `str` view when they form
+// valid UTF-8, see `parse_uri_with_policy`.
+static URI_MAP_STRICT: [bool; 256] = byte_map!(
+    b'!'..=0x7e
+);
+
+static URI_MAP_OBS_TEXT: [bool; 256] = byte_map!(
     b'!'..=0x7e | 0x80..=0xFF
 );
 
+/// Whether `b` is accepted in a request target under the default strict
+/// policy: visible ASCII only, DEL and every high byte are rejected.
 #[inline]
 pub(crate) fn is_uri_token(b: u8) -> bool {
-    URI_MAP[b as usize]
+    URI_MAP_STRICT[b as usize]
+}
+
+/// Whether `b` is accepted in a request target when `obs-text` is
+/// explicitly opted into via
+/// [`ParserConfig::allow_obs_text_in_request_target`].
+#[inline]
+pub(crate) fn is_uri_obs_text_token(b: u8) -> bool {
+    URI_MAP_OBS_TEXT[b as usize]
+}
+
+/// The single security decision applied while splitting a request line.
+///
+/// Both the byte-level request target scan (the SIMD/SWAR backends) and the
+/// final `str` view are derived from this structure, so the whitespace
+/// configuration and the URI grammar can never disagree about which bytes
+/// belong to the request target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RequestLinePolicy {
+    allow_multiple_spaces: bool,
+    allow_obs_text: bool,
+}
+
+impl RequestLinePolicy {
+    #[inline]
+    fn from_config(config: &ParserConfig) -> RequestLinePolicy {
+        RequestLinePolicy {
+            allow_multiple_spaces: config.allow_multiple_spaces_in_request_line_delimiters,
+            allow_obs_text: config.allow_obs_text_in_request_target,
+        }
+    }
 }
 
 static TOKEN_MAP: [bool; 256] = byte_map!(
@@ -212,6 +257,7 @@ pub struct ParserConfig {
     allow_obsolete_multiline_headers_in_responses: bool,
     allow_multiple_spaces_in_request_line_delimiters: bool,
     allow_multiple_spaces_in_response_status_delimiters: bool,
+    allow_obs_text_in_request_target: bool,
     allow_space_before_first_header_name: bool,
     ignore_invalid_headers_in_responses: bool,
     ignore_invalid_headers_in_requests: bool,
@@ -248,6 +294,36 @@ impl ParserConfig {
     /// Whether multiple spaces are allowed as delimiters in request lines.
     pub fn multiple_spaces_in_request_line_delimiters_are_allowed(&self) -> bool {
         self.allow_multiple_spaces_in_request_line_delimiters
+    }
+
+    /// Sets whether bare `obs-text` bytes (`%x80-FF`) are allowed in the request target.
+    ///
+    /// This is disabled by default. The request target of an HTTP/1.x request is a
+    /// sequence of visible ASCII characters (`%x21-7E`); any other byte must be
+    /// percent-encoded. A bare high byte is therefore ambiguous: different
+    /// intermediaries may percent-encode, decode, replace or reject it, so a reverse
+    /// proxy and the backend can end up routing different paths. The default strict
+    /// policy rejects such bytes (along with control bytes and DEL) instead of
+    /// passing them through.
+    ///
+    /// Enabling this option restores the historical behavior where high bytes are
+    /// accepted as-is. Even with the option enabled, the request target is only
+    /// exposed through [`Request::path`] when the bytes form valid UTF-8; otherwise
+    /// parsing fails, so the returned `str` always stays a faithful view of the
+    /// accepted bytes. Ambiguous encodings such as DEL (`%x7F`), control bytes,
+    /// spaces and tabs inside the request target remain rejected regardless of this
+    /// setting.
+    ///
+    /// Only enable this if every intermediary on the path applies the exact same
+    /// policy, otherwise prefer rejecting or percent-encoding the bytes upstream.
+    pub fn allow_obs_text_in_request_target(&mut self, value: bool) -> &mut Self {
+        self.allow_obs_text_in_request_target = value;
+        self
+    }
+
+    /// Whether bare `obs-text` bytes are allowed in the request target.
+    pub fn obs_text_in_request_target_is_allowed(&self) -> bool {
+        self.allow_obs_text_in_request_target
     }
 
     /// Sets whether multiple spaces are allowed as delimiters in response status lines.
@@ -487,13 +563,14 @@ impl<'h, 'b> Request<'h, 'b> {
         let orig_len = buf.len();
         let mut bytes = Bytes::new(buf);
         complete!(skip_empty_lines(&mut bytes));
+        let policy = RequestLinePolicy::from_config(config);
         let method = complete!(parse_method(&mut bytes));
         self.method = Some(method);
-        if config.allow_multiple_spaces_in_request_line_delimiters {
+        if policy.allow_multiple_spaces {
             complete!(skip_spaces(&mut bytes));
         }
-        self.path = Some(complete!(parse_uri(&mut bytes)));
-        if config.allow_multiple_spaces_in_request_line_delimiters {
+        self.path = Some(complete!(parse_uri_with_policy(&mut bytes, policy)));
+        if policy.allow_multiple_spaces {
             complete!(skip_spaces(&mut bytes));
         }
         self.version = Some(complete!(parse_version(&mut bytes)));
@@ -910,8 +987,24 @@ fn parse_token<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
 #[allow(missing_docs)]
 // WARNING: Exported for internal benchmarks, not fit for public consumption
 pub fn parse_uri<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
+    parse_uri_with_policy(bytes, RequestLinePolicy::default())
+}
+
+/// Parses the request target under the given [`RequestLinePolicy`].
+///
+/// The byte scan and the construction of the returned `str` share one decision:
+/// the policy's URI table decides which bytes may end the request target, and the
+/// same policy decides whether a UTF-8 validation is required before exposing the
+/// view. Ambiguous bytes (DEL, controls, whitespace, and high bytes unless
+/// `obs-text` is explicitly enabled) stop the scan and are never hidden behind a
+/// permissive cast.
+#[inline]
+pub(crate) fn parse_uri_with_policy<'a>(
+    bytes: &mut Bytes<'a>,
+    policy: RequestLinePolicy,
+) -> Result<&'a str> {
     let start = bytes.pos();
-    simd::match_uri_vectored(bytes);
+    simd::match_uri_vectored(bytes, policy);
     let end = bytes.pos();
 
     if next!(bytes) == b' ' {
@@ -920,11 +1013,22 @@ pub fn parse_uri<'a>(bytes: &mut Bytes<'a>) -> Result<&'a str> {
             return Err(Error::Token);
         }
 
-        // SAFETY: all bytes up till `i` must have been `is_token` and therefore also utf-8.
-        match str::from_utf8(unsafe { bytes.slice_skip(1) }) {
-            Ok(uri) => Ok(Status::Complete(uri)),
-            Err(_) => Err(Error::Token),
-        }
+        // SAFETY: the terminating space was just consumed by `next!`, so the
+        // cursor is one byte past the slice we are about to take.
+        let uri_bytes = unsafe { bytes.slice_skip(1) };
+        let uri = if policy.allow_obs_text {
+            // High bytes were only accepted by explicit opt-in; they are not
+            // necessarily ASCII, so validate the whole view instead of casting.
+            match str::from_utf8(uri_bytes) {
+                Ok(uri) => uri,
+                Err(_) => return Err(Error::Token),
+            }
+        } else {
+            // SAFETY: the strict URI table accepts `%x21-7E` only, every byte is
+            // visible ASCII and thus valid UTF-8.
+            unsafe { str::from_utf8_unchecked(uri_bytes) }
+        };
+        Ok(Status::Complete(uri))
     } else {
         Err(Error::Token)
     }
@@ -2115,9 +2219,8 @@ mod tests {
         assert_eq!(result, Err(crate::Error::Version));
     }
 
-    // This test ensure there is an error when there is a DEL character in the path
-    // since we allow all char from 0x21 code except DEL, this test ensure that DEL
-    // is not allowed in the path
+    // DEL is never part of a request target, not even when obs-text is enabled:
+    // obs-text only covers %x80-FF while DEL is %x7F.
     static REQUEST_WITH_DEL_IN_PATH: &[u8] = b"GET   /foo\x7Fohno HTTP/1.1\r\n\r\n";
 
     #[test]
@@ -2128,6 +2231,68 @@ mod tests {
             .allow_multiple_spaces_in_request_line_delimiters(true)
             .parse_request(&mut request, crate::tests::REQUEST_WITH_DEL_IN_PATH);
         assert_eq!(result, Err(crate::Error::Token));
+    }
+
+    #[test]
+    fn test_request_with_del_in_path_even_with_obs_text() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut request = Request::new(&mut headers[..]);
+        let result = crate::ParserConfig::default()
+            .allow_obs_text_in_request_target(true)
+            .parse_request(&mut request, crate::tests::REQUEST_WITH_DEL_IN_PATH);
+        assert_eq!(result, Err(crate::Error::Token));
+    }
+
+    // A bare high byte is ambiguous across intermediaries, so the default strict
+    // policy rejects it. Only an explicit opt-in restores the historical behavior.
+    static REQUEST_WITH_OBS_TEXT_IN_PATH: &[u8] =
+        b"GET /caf\xC3\xA9 HTTP/1.1\r\n\r\n";
+
+    #[test]
+    fn test_request_with_obs_text_in_path_rejected_by_default() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut request = Request::new(&mut headers[..]);
+        let result = request.parse(crate::tests::REQUEST_WITH_OBS_TEXT_IN_PATH);
+        assert_eq!(result, Err(crate::Error::Token));
+        assert!(request.path.is_none());
+    }
+
+    #[test]
+    fn test_request_with_obs_text_in_path_allowed_when_enabled() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut request = Request::new(&mut headers[..]);
+        let result = crate::ParserConfig::default()
+            .allow_obs_text_in_request_target(true)
+            .parse_request(&mut request, crate::tests::REQUEST_WITH_OBS_TEXT_IN_PATH);
+        assert_eq!(
+            result,
+            Ok(Status::Complete(
+                crate::tests::REQUEST_WITH_OBS_TEXT_IN_PATH.len()
+            ))
+        );
+        assert_eq!(request.path.unwrap(), "/caf\u{e9}");
+    }
+
+    #[test]
+    fn test_request_with_invalid_utf8_obs_text_rejected_even_when_enabled() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut request = Request::new(&mut headers[..]);
+        let result = crate::ParserConfig::default()
+            .allow_obs_text_in_request_target(true)
+            .parse_request(&mut request, b"GET /x\x80y HTTP/1.1\r\n\r\n");
+        assert_eq!(result, Err(crate::Error::Token));
+        assert!(request.path.is_none());
+    }
+
+    #[test]
+    fn test_request_target_config_getters() {
+        let config = crate::ParserConfig::default();
+        assert!(!config.obs_text_in_request_target_is_allowed());
+        assert!(!config.multiple_spaces_in_request_line_delimiters_are_allowed());
+
+        let mut config = crate::ParserConfig::default();
+        config.allow_obs_text_in_request_target(true);
+        assert!(config.obs_text_in_request_target_is_allowed());
     }
 
     #[test]
@@ -2145,6 +2310,7 @@ mod tests {
                         let first_line = format!("GET /{} HTTP/1.1\r\n\r\n", s);
                         let result = crate::ParserConfig::default()
                             .allow_multiple_spaces_in_request_line_delimiters(true)
+                            .allow_obs_text_in_request_target(true)
                             .parse_request(&mut request, first_line.as_bytes());
 
                         assert_eq!(result, Ok(Status::Complete(20)), "failed for utf8 char i: {}, j: {}", i, j);
@@ -2156,6 +2322,7 @@ mod tests {
 
                         let result = crate::ParserConfig::default()
                             .allow_multiple_spaces_in_request_line_delimiters(true)
+                            .allow_obs_text_in_request_target(true)
                             .parse_request(&mut request, first_line.as_slice());
 
                         assert_eq!(result, Err(crate::Error::Token), "failed for utf8 char i: {}, j: {}", i, j);
@@ -2177,6 +2344,7 @@ mod tests {
                             let first_line = format!("GET /{} HTTP/1.1\r\n\r\n", s);
                             let result = crate::ParserConfig::default()
                                 .allow_multiple_spaces_in_request_line_delimiters(true)
+                            .allow_obs_text_in_request_target(true)
                                 .parse_request(&mut request, first_line.as_bytes());
 
                             assert_eq!(result, Ok(Status::Complete(21)), "failed for utf8 char i: {}, j: {}, k: {}", i, j, k);
@@ -2188,6 +2356,7 @@ mod tests {
 
                             let result = crate::ParserConfig::default()
                                 .allow_multiple_spaces_in_request_line_delimiters(true)
+                            .allow_obs_text_in_request_target(true)
                                 .parse_request(&mut request, first_line.as_slice());
 
                             assert_eq!(result, Err(crate::Error::Token), "failed for utf8 char i: {}, j: {}, k: {}", i, j, k);
@@ -2209,6 +2378,7 @@ mod tests {
                                 let first_line = format!("GET /{} HTTP/1.1\r\n\r\n", s);
                                 let result = crate::ParserConfig::default()
                                     .allow_multiple_spaces_in_request_line_delimiters(true)
+                            .allow_obs_text_in_request_target(true)
                                     .parse_request(&mut request, first_line.as_bytes());
 
                                 assert_eq!(result, Ok(Status::Complete(22)), "failed for utf8 char i: {}, j: {}, k: {}, l: {}", i, j, k, l);
@@ -2220,6 +2390,7 @@ mod tests {
 
                                 let result = crate::ParserConfig::default()
                                     .allow_multiple_spaces_in_request_line_delimiters(true)
+                            .allow_obs_text_in_request_target(true)
                                     .parse_request(&mut request, first_line.as_slice());
 
                                 assert_eq!(result, Err(crate::Error::Token), "failed for utf8 char i: {}, j: {}, k: {}, l: {}", i, j, k, l);
@@ -2761,6 +2932,22 @@ mod tests {
         let mut request = Request::new(&mut headers[..]);
 
         let result = crate::ParserConfig::default().parse_request(&mut request, b"GET /test?post=I\xE2\x80\x99msorryIforkedyou HTTP/1.1\r\nHost: example.org\r\n\r\n");
+
+        // Bare high bytes are ambiguous and rejected by the default strict policy.
+        assert_eq!(result, Err(crate::Error::Token));
+    }
+
+    #[test]
+    fn test_utf8_in_path_ok_when_obs_text_allowed() {
+        let mut headers = [EMPTY_HEADER; 1];
+        let mut request = Request::new(&mut headers[..]);
+
+        let result = crate::ParserConfig::default()
+            .allow_obs_text_in_request_target(true)
+            .parse_request(
+                &mut request,
+                b"GET /test?post=I\xE2\x80\x99msorryIforkedyou HTTP/1.1\r\nHost: example.org\r\n\r\n",
+            );
 
         assert_eq!(result, Ok(Status::Complete(67)));
         assert_eq!(request.version.unwrap(), 1);

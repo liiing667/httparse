@@ -1,13 +1,58 @@
 /// SWAR: SIMD Within A Register
 /// SIMD validator backend that validates register-sized chunks of data at a time.
-use crate::{is_header_name_token, is_header_value_token, is_uri_token, Bytes};
+use crate::{
+    is_header_name_token, is_header_value_token, is_uri_obs_text_token,
+    is_uri_token, Bytes, RequestLinePolicy,
+};
 
 // Adapt block-size to match native register size, i.e: 32bit => 4, 64bit => 8
 const BLOCK_SIZE: usize = core::mem::size_of::<usize>();
 type ByteBlock = [u8; BLOCK_SIZE];
 
+/// Request target scan driven by the shared [`RequestLinePolicy`].
+///
+/// The strict fast path only accepts visible ASCII (`%x21-7E`), so DEL,
+/// control bytes and every high byte stop the scan without a table lookup.
+/// The permissive path keeps the historical `obs-text` acceptance.
 #[inline]
-pub fn match_uri_vectored(bytes: &mut Bytes) {
+pub fn match_uri_vectored(bytes: &mut Bytes, policy: RequestLinePolicy) {
+    if policy.allow_obs_text {
+        match_uri_obs_text(bytes);
+    } else {
+        match_uri_ascii(bytes);
+    }
+}
+
+#[inline]
+fn match_uri_ascii(bytes: &mut Bytes) {
+    loop {
+        if let Some(bytes8) = bytes.peek_n::<BLOCK_SIZE>() {
+            let n = match_uri_ascii_char_8_swar(bytes8);
+            // SAFETY: using peek_n to retrieve the bytes ensures that there are at least n more bytes
+            // in `bytes`, so calling `advance(n)` is safe.
+            unsafe {
+                bytes.advance(n);
+            }
+            if n == BLOCK_SIZE {
+                continue;
+            }
+        }
+        if let Some(b) = bytes.peek() {
+            if is_uri_token(b) {
+                // SAFETY: using peek to retrieve the byte ensures that there is at least 1 more byte
+                // in bytes, so calling advance is safe.
+                unsafe {
+                    bytes.advance(1);
+                }
+                continue;
+            }
+        }
+        break;
+    }
+}
+
+#[inline]
+fn match_uri_obs_text(bytes: &mut Bytes) {
     loop {
         if let Some(bytes8) = bytes.peek_n::<BLOCK_SIZE>() {
             let n = match_uri_char_8_swar(bytes8);
@@ -21,7 +66,7 @@ pub fn match_uri_vectored(bytes: &mut Bytes) {
             }
         }
         if let Some(b) = bytes.peek() {
-            if is_uri_token(b) {
+            if is_uri_obs_text_token(b) {
                 // SAFETY: using peek to retrieve the byte ensures that there is at least 1 more byte
                 // in bytes, so calling advance is safe.
                 unsafe {
@@ -133,6 +178,31 @@ fn match_uri_char_8_swar(block: ByteBlock) -> usize {
 }
 
 // A byte-wise range-check on an entire word/block,
+// ensuring all bytes in the word satisfy the strict request target rule
+// `33 <= x <= 126` (visible ASCII only). DEL and every high byte fail.
+#[inline]
+fn match_uri_ascii_char_8_swar(block: ByteBlock) -> usize {
+    // 33 <= x <= 126
+    const M: u8 = 0x21;
+    // uniform block full of exclamation mark (!) (33).
+    const BM: usize = uniform_block(M);
+    // uniform block full of 128, used to detect both underflow and the high bit.
+    const M128: usize = uniform_block(128);
+
+    let x = usize::from_ne_bytes(block); // Really just a transmute
+    let lt = x.wrapping_sub(BM) & !x; // x < 33 sets the high bit
+    let high = x & M128; // x >= 128 sets the high bit
+
+    // DEL (127) has no high bit and is not below 33, catch it explicitly.
+    const DEL: usize = uniform_block(0x7f);
+    const ONE: usize = uniform_block(0x01);
+    let xor_del = x ^ DEL;
+    let eq_del = xor_del.wrapping_sub(ONE) & !xor_del; // == DEL
+
+    offsetnz((lt | high | eq_del) & M128)
+}
+
+// A byte-wise range-check on an entire word/block,
 // ensuring all bytes in the word satisfy `32 <= (x != 127) <= 255`
 #[inline]
 fn match_header_value_char_8_swar(block: ByteBlock) -> usize {
@@ -219,6 +289,33 @@ fn test_is_uri_block() {
     // 128..=255 => true
     for b in 128..=255_u8 {
         assert!(is_uri_block([b; BLOCK_SIZE]), "b={}", b);
+    }
+}
+
+#[test]
+fn test_is_uri_ascii_block() {
+    let is_uri_block = |b| match_uri_ascii_char_8_swar(b) == BLOCK_SIZE;
+
+    // 0..33 => false (controls and space)
+    for b in 0..33_u8 {
+        assert!(!is_uri_block([b; BLOCK_SIZE]), "b={}", b);
+    }
+    // 33..=126 => true (visible ASCII)
+    for b in 33..=126_u8 {
+        assert!(is_uri_block([b; BLOCK_SIZE]), "b={}", b);
+    }
+    // 127 => false (DEL)
+    assert!(!is_uri_block([b'\x7F'; BLOCK_SIZE]), "b={}", b'\x7F');
+    // 128..=255 => false (obs-text is rejected by the strict policy)
+    for b in 128..=255_u8 {
+        assert!(!is_uri_block([b; BLOCK_SIZE]), "b={}", b);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert!(!is_uri_block(*b"foo.com\x80"));
+        assert!(!is_uri_block(*b"foo.com\x7f"));
+        assert!(is_uri_block(*b"foo.com/"));
     }
 }
 

@@ -34,13 +34,13 @@ pub fn match_header_name_vectored(bytes: &mut Bytes) {
     super::swar::match_header_name_vectored(bytes);
 }
 
-pub fn match_uri_vectored(bytes: &mut Bytes) {
+pub fn match_uri_vectored(bytes: &mut Bytes, policy: crate::RequestLinePolicy) {
     // SAFETY: calls are guarded by a feature check
     unsafe {
         match get_runtime_feature() {
-            AVX2 => avx2::match_uri_vectored(bytes),
-            SSE42 => sse42::match_uri_vectored(bytes),
-            _ /* NOP */ => super::swar::match_uri_vectored(bytes),
+            AVX2 => avx2::match_uri_vectored(bytes, policy),
+            SSE42 => sse42::match_uri_vectored(bytes, policy),
+            _ /* NOP */ => super::swar::match_uri_vectored(bytes, policy),
         }
     }
 }

@@ -34,11 +34,21 @@ pub fn match_header_value_vectored(bytes: &mut Bytes) {
 }
 
 #[inline]
-pub fn match_uri_vectored(bytes: &mut Bytes) {
+#[cfg(test)]
+pub fn match_uri_vectored_default(bytes: &mut Bytes) {
+    match_uri_vectored(bytes, crate::RequestLinePolicy::default())
+}
+
+#[inline]
+pub fn match_uri_vectored(bytes: &mut Bytes, policy: crate::RequestLinePolicy) {
     while bytes.as_ref().len() >= 16 {
         // SAFETY: ensured that there are at least 16 bytes remaining 
         unsafe {
-            let advance = match_url_char_16_neon(bytes.as_ref().as_ptr());
+            let advance = if policy.allow_obs_text {
+                match_url_char_16_neon(bytes.as_ref().as_ptr())
+            } else {
+                match_url_ascii_char_16_neon(bytes.as_ref().as_ptr())
+            };
             bytes.advance(advance);
 
             if advance != 16 {
@@ -46,7 +56,7 @@ pub fn match_uri_vectored(bytes: &mut Bytes) {
             }
         }
     }
-    super::swar::match_uri_vectored(bytes);
+    super::swar::match_uri_vectored(bytes, policy);
 }
 
 const fn bit_set(x: u8) -> bool {
@@ -136,6 +146,18 @@ unsafe fn match_url_char_16_neon(ptr: *const u8) -> usize {
 }
 
 #[inline]
+unsafe fn match_url_ascii_char_16_neon(ptr: *const u8) -> usize {
+    let input = vld1q_u8(ptr);
+
+    // strict request target: visible ASCII only, %x21 <= input <= %x7e.
+    let ge_low = vcleq_u8(vdupq_n_u8(b'!'), input);
+    let le_high = vcleq_u8(input, vdupq_n_u8(b'~'));
+    let result = vandq_u8(ge_low, le_high);
+
+    offsetz(result) as usize
+}
+
+#[inline]
 unsafe fn match_header_value_char_16_neon(ptr: *const u8) -> usize {
     let input = vld1q_u8(ptr);
 
@@ -192,11 +214,32 @@ unsafe fn offsetnz(x: uint8x16_t) -> u32 {
 fn neon_code_matches_uri_chars_table() {
     #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
-        assert!(byte_is_allowed(b'_', match_uri_vectored));
+        assert!(byte_is_allowed(b'_', match_uri_vectored_default));
 
-        for (b, allowed) in crate::URI_MAP.iter().cloned().enumerate() {
+        for (b, allowed) in crate::URI_MAP_STRICT.iter().cloned().enumerate() {
             assert_eq!(
-                byte_is_allowed(b as u8, match_uri_vectored),
+                byte_is_allowed(b as u8, match_uri_vectored_default),
+                allowed,
+                "byte_is_allowed({:?}) should be {:?}",
+                b,
+                allowed,
+            );
+        }
+    }
+}
+
+#[test]
+fn neon_code_matches_obs_text_uri_chars_table() {
+    let policy = crate::RequestLinePolicy {
+        allow_multiple_spaces: false,
+        allow_obs_text: true,
+    };
+
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    unsafe {
+        for (b, allowed) in crate::URI_MAP_OBS_TEXT.iter().cloned().enumerate() {
+            assert_eq!(
+                byte_is_allowed_policy(b as u8, policy, match_uri_vectored),
                 allowed,
                 "byte_is_allowed({:?}) should be {:?}",
                 b,
@@ -249,6 +292,25 @@ unsafe fn byte_is_allowed(byte: u8, f: unsafe fn(bytes: &mut Bytes<'_>)) -> bool
     let mut bytes = Bytes::new(&slice);
 
     f(&mut bytes);
+
+    match bytes.pos() {
+        16 => true,
+        10 => false,
+        x => panic!("unexpected pos: {}", x),
+    }
+}
+
+#[cfg(test)]
+unsafe fn byte_is_allowed_policy(
+    byte: u8,
+    policy: crate::RequestLinePolicy,
+    f: unsafe fn(bytes: &mut Bytes<'_>, crate::RequestLinePolicy),
+) -> bool {
+    let mut slice = [b'_'; 16];
+    slice[10] = byte;
+    let mut bytes = Bytes::new(&slice);
+
+    f(&mut bytes, policy);
 
     match bytes.pos() {
         16 => true,

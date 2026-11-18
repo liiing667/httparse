@@ -1,11 +1,25 @@
 use crate::iter::Bytes;
 
+#[cfg(test)]
 #[inline]
 #[target_feature(enable = "avx2")]
-pub unsafe fn match_uri_vectored(bytes: &mut Bytes) {
+pub unsafe fn match_uri_vectored_default(bytes: &mut Bytes) {
+    match_uri_vectored(bytes, crate::RequestLinePolicy::default())
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+pub unsafe fn match_uri_vectored(
+    bytes: &mut Bytes,
+    policy: crate::RequestLinePolicy,
+) {
     while bytes.as_ref().len() >= 32 {
 
-        let advance = match_url_char_32_avx(bytes.as_ref());
+        let advance = if policy.allow_obs_text {
+            match_url_char_32_avx(bytes.as_ref())
+        } else {
+            match_url_ascii_char_32_avx(bytes.as_ref())
+        };
 
         bytes.advance(advance);
 
@@ -14,7 +28,33 @@ pub unsafe fn match_uri_vectored(bytes: &mut Bytes) {
         }
     }
     // NOTE: use SWAR for <32B, more efficient than falling back to SSE4.2
-    super::swar::match_uri_vectored(bytes)
+    super::swar::match_uri_vectored(bytes, policy)
+}
+
+#[inline(always)]
+#[allow(non_snake_case)]
+unsafe fn match_url_ascii_char_32_avx(buf: &[u8]) -> usize {
+    debug_assert!(buf.len() >= 32);
+
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let ptr = buf.as_ptr();
+
+    // strict request target: %x21-%x7e only (visible ASCII)
+    let LOW: __m256i = _mm256_set1_epi8(0x21);
+    let HIGH: __m256i = _mm256_set1_epi8(0x7e);
+
+    let dat = _mm256_lddqu_si256(ptr as *const _);
+    // unsigned range check: LOW <= dat <= HIGH
+    let ge_low = _mm256_cmpeq_epi8(_mm256_max_epu8(dat, LOW), dat);
+    let le_high = _mm256_cmpeq_epi8(_mm256_min_epu8(dat, HIGH), dat);
+    let bit = _mm256_and_si256(ge_low, le_high);
+    let res = _mm256_movemask_epi8(bit) as u32;
+
+    res.trailing_ones() as usize
 }
 
 #[inline(always)]
@@ -148,12 +188,37 @@ fn avx2_code_matches_uri_chars_table() {
 
     #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
-        assert!(byte_is_allowed(b'_', match_uri_vectored));
+        assert!(byte_is_allowed(b'_', match_uri_vectored_default));
 
-        for (b, allowed) in crate::URI_MAP.iter().cloned().enumerate() {
+        for (b, allowed) in crate::URI_MAP_STRICT.iter().cloned().enumerate() {
             assert_eq!(
-                byte_is_allowed(b as u8, match_uri_vectored), allowed,
+                byte_is_allowed(b as u8, match_uri_vectored_default), allowed,
                 "byte_is_allowed({:?}) should be {:?}", b, allowed,
+            );
+        }
+    }
+}
+
+#[test]
+fn avx2_code_matches_obs_text_uri_chars_table() {
+    if !is_x86_feature_detected!("avx2") {
+        return;
+    }
+
+    let policy = crate::RequestLinePolicy {
+        allow_multiple_spaces: false,
+        allow_obs_text: true,
+    };
+
+    #[allow(clippy::undocumented_unsafe_blocks)]
+    unsafe {
+        for (b, allowed) in crate::URI_MAP_OBS_TEXT.iter().cloned().enumerate() {
+            assert_eq!(
+                byte_is_allowed_policy(b as u8, policy, match_uri_vectored),
+                allowed,
+                "byte_is_allowed({:?}) should be {:?}",
+                b,
+                allowed,
             );
         }
     }
@@ -193,6 +258,33 @@ unsafe fn byte_is_allowed(byte: u8, f: unsafe fn(bytes: &mut Bytes<'_>)) -> bool
     let mut bytes = Bytes::new(&slice);
 
     f(&mut bytes);
+
+    match bytes.pos() {
+        32 => true,
+        26 => false,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+unsafe fn byte_is_allowed_policy(
+    byte: u8,
+    policy: crate::RequestLinePolicy,
+    f: unsafe fn(bytes: &mut Bytes<'_>, crate::RequestLinePolicy),
+) -> bool {
+    let slice = [
+        b'_', b'_', b'_', b'_',
+        b'_', b'_', b'_', b'_',
+        b'_', b'_', b'_', b'_',
+        b'_', b'_', b'_', b'_',
+        b'_', b'_', b'_', b'_',
+        b'_', b'_', b'_', b'_',
+        b'_', b'_', byte, b'_',
+        b'_', b'_', b'_', b'_',
+    ];
+    let mut bytes = Bytes::new(&slice);
+
+    f(&mut bytes, policy);
 
     match bytes.pos() {
         32 => true,

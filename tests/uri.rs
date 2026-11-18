@@ -3690,3 +3690,123 @@ req! {
         assert_eq!(req.headers[0].value, b"gfwsl.geforce.com");
     }
 }
+
+// The default request target grammar is visible ASCII only (%x21-7E). Bare
+// high bytes and DEL are ambiguous across intermediaries and must be rejected
+// instead of being passed through to the `path` view.
+req! {
+    urltest_reject_obs_text_by_default,
+    b"GET /caf\xC3\xA9 HTTP/1.1\r\nHost: example.org\r\n\r\n",
+    Err(Error::Token),
+    |req| {
+        assert!(req.path.is_none());
+    }
+}
+
+req! {
+    urltest_reject_del_by_default,
+    b"GET /foo\x7Fbar HTTP/1.1\r\nHost: example.org\r\n\r\n",
+    Err(Error::Token),
+    |req| {
+        assert!(req.path.is_none());
+    }
+}
+
+req! {
+    urltest_reject_control_byte_by_default,
+    b"GET /foo\x01bar HTTP/1.1\r\nHost: example.org\r\n\r\n",
+    Err(Error::Token),
+    |req| {
+        assert!(req.path.is_none());
+    }
+}
+
+// Percent-encoded bytes stay on the visible-ASCII surface and remain accepted,
+// including encodings that represent high bytes when decoded upstream.
+req! {
+    urltest_percent_encoded_high_byte_still_accepted,
+    b"GET /caf%C3%A9 HTTP/1.1\r\nHost: example.org\r\n\r\n",
+    |req| {
+        assert_eq!(req.method.unwrap(), "GET");
+        assert_eq!(req.path.unwrap(), "/caf%C3%A9");
+        assert_eq!(req.version.unwrap(), 1);
+    }
+}
+
+#[test]
+fn urltest_obs_text_accepted_only_with_explicit_opt_in() {
+    let buf = b"GET /caf\xC3\xA9 HTTP/1.1\r\nHost: example.org\r\n\r\n";
+
+    let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+    let mut request = Request::new(&mut headers[..]);
+    let status = httparse::ParserConfig::default()
+        .allow_obs_text_in_request_target(true)
+        .parse_request(&mut request, buf);
+    assert_eq!(status, Ok(Status::Complete(buf.len())));
+    assert_eq!(request.path.unwrap(), "/caf\u{e9}");
+}
+
+#[test]
+fn urltest_obs_text_opt_in_does_not_allow_del_or_controls() {
+    for buf in [
+        &b"GET /foo\x7Fbar HTTP/1.1\r\n\r\n"[..],
+        &b"GET /foo\x01bar HTTP/1.1\r\n\r\n"[..],
+    ] {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut request = Request::new(&mut headers[..]);
+        let status = httparse::ParserConfig::default()
+            .allow_obs_text_in_request_target(true)
+            .parse_request(&mut request, buf);
+        assert_eq!(status, Err(Error::Token));
+        assert!(request.path.is_none());
+    }
+}
+
+#[test]
+fn urltest_invalid_utf8_obs_text_rejected_even_when_enabled() {
+    let buf = b"GET /x\x80y HTTP/1.1\r\n\r\n";
+    let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+    let mut request = Request::new(&mut headers[..]);
+    let status = httparse::ParserConfig::default()
+        .allow_obs_text_in_request_target(true)
+        .parse_request(&mut request, buf);
+    assert_eq!(status, Err(Error::Token));
+    assert!(request.path.is_none());
+}
+
+// The whitespace option only changes delimiter folding; it must not change the
+// URI safety decision, so a high byte reached after folded spaces is still
+// rejected by the default policy and accepted after an explicit obs-text opt-in.
+#[test]
+fn urltest_multispaces_share_uri_decision() {
+    let buf = b"GET   /caf\xC3\xA9   HTTP/1.1\r\n\r\n";
+
+    let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+    let mut request = Request::new(&mut headers[..]);
+    let status = httparse::ParserConfig::default()
+        .allow_multiple_spaces_in_request_line_delimiters(true)
+        .parse_request(&mut request, buf);
+    assert_eq!(status, Err(Error::Token));
+    assert!(request.path.is_none());
+
+    let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+    let mut request = Request::new(&mut headers[..]);
+    let status = httparse::ParserConfig::default()
+        .allow_multiple_spaces_in_request_line_delimiters(true)
+        .allow_obs_text_in_request_target(true)
+        .parse_request(&mut request, buf);
+    assert_eq!(status, Ok(Status::Complete(buf.len())));
+    assert_eq!(request.path.unwrap(), "/caf\u{e9}");
+}
+
+#[test]
+fn urltest_multispaces_keep_historical_ascii_paths() {
+    let buf = b"GET  /    HTTP/1.1\r\n\r\n";
+    let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+    let mut request = Request::new(&mut headers[..]);
+    let status = httparse::ParserConfig::default()
+        .allow_multiple_spaces_in_request_line_delimiters(true)
+        .parse_request(&mut request, buf);
+    assert_eq!(status, Ok(Status::Complete(buf.len())));
+    assert_eq!(request.path.unwrap(), "/");
+}
