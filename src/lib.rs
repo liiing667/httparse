@@ -205,6 +205,159 @@ impl<T> Status<T> {
     }
 }
 
+/// The risk category of a parsing deviation that was tolerated because a
+/// relaxed `ParserConfig` option was enabled.
+///
+/// Every entry in an [`Audit`] log is tagged with one of these categories, so
+/// downstream consumers (for example proxies writing access logs) can prove
+/// which class of leniency was applied to a given message.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RiskCategory {
+    /// Multiple spaces were accepted as delimiters in the request line or the
+    /// response status line, instead of exactly one.
+    ///
+    /// Enabled by
+    /// [`ParserConfig::allow_multiple_spaces_in_request_line_delimiters`] or
+    /// [`ParserConfig::allow_multiple_spaces_in_response_status_delimiters`].
+    MultipleSpacesDelimiter,
+    /// An invalid header line was skipped instead of being rejected with an
+    /// [`Error`]. The skipped bytes are *not* part of the parsed output, so
+    /// the parsed message differs from the raw message on the wire.
+    ///
+    /// Enabled by [`ParserConfig::ignore_invalid_headers_in_requests`] or
+    /// [`ParserConfig::ignore_invalid_headers_in_responses`].
+    InvalidHeaderSkipped,
+    /// Obsolete line folding (`obs-fold`) was accepted inside a header value.
+    /// The folded newlines remain part of the header value.
+    ///
+    /// Enabled by
+    /// [`ParserConfig::allow_obsolete_multiline_headers_in_responses`].
+    ObsoleteLineFolding,
+    /// Whitespace before the first header name was ignored.
+    ///
+    /// Enabled by [`ParserConfig::allow_space_before_first_header_name`].
+    SpaceBeforeFirstHeader,
+    /// Spaces or tabs between a header name and its colon were ignored.
+    ///
+    /// Enabled by
+    /// [`ParserConfig::allow_spaces_after_header_name_in_responses`].
+    SpaceAfterHeaderName,
+}
+
+/// A single parsing deviation that was tolerated during a parse pass.
+///
+/// The deviation stayed invisible to the parsed output (or, in the case of
+/// [`RiskCategory::ObsoleteLineFolding`], altered the shape of a header
+/// value), so it is reported here to make the parse auditable.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct IgnoredFact {
+    /// Byte offset in the parsed buffer where the deviation was detected.
+    pub offset: usize,
+    /// Length in bytes of the deviating region, when known.
+    pub len: usize,
+    /// The risk category of the deviation.
+    pub category: RiskCategory,
+}
+
+/// An audit log of the parsing deviations tolerated during a parse pass.
+///
+/// The log writes into a caller-provided buffer, keeping the parser
+/// allocation-free and `no_std` compatible. When all relaxed options are
+/// disabled (the default), the log is guaranteed to stay empty, matching the
+/// strict behaviour of [`Request::parse`] and [`Response::parse`].
+///
+/// # Example
+///
+/// ```rust
+/// let buf = b"GET  / HTTP/1.1\r\nHost: example.domain\r\n\r\n";
+/// let mut headers = [httparse::EMPTY_HEADER; 16];
+/// let mut req = httparse::Request::new(&mut headers);
+/// let mut facts = [httparse::IgnoredFact {
+///     offset: 0,
+///     len: 0,
+///     category: httparse::RiskCategory::MultipleSpacesDelimiter,
+/// }; 8];
+/// let mut audit = httparse::Audit::new(&mut facts);
+///
+/// let status = httparse::ParserConfig::default()
+///     .allow_multiple_spaces_in_request_line_delimiters(true)
+///     .parse_request_audited(&mut req, buf, &mut audit);
+///
+/// assert_eq!(status, Ok(httparse::Status::Complete(buf.len())));
+/// assert_eq!(audit.facts().len(), 1);
+/// assert_eq!(
+///     audit.facts()[0].category,
+///     httparse::RiskCategory::MultipleSpacesDelimiter
+/// );
+/// ```
+#[derive(Debug)]
+pub struct Audit<'a> {
+    facts: &'a mut [IgnoredFact],
+    len: usize,
+    dropped: usize,
+}
+
+impl<'a> Audit<'a> {
+    /// Creates a new audit log that records into the caller-provided buffer.
+    ///
+    /// If more deviations are encountered than the buffer can hold, the extra
+    /// ones are counted in [`Audit::dropped`] instead.
+    pub fn new(facts: &'a mut [IgnoredFact]) -> Audit<'a> {
+        Audit {
+            facts,
+            len: 0,
+            dropped: 0,
+        }
+    }
+
+    /// The deviations recorded so far, in the order they were encountered.
+    pub fn facts(&self) -> &[IgnoredFact] {
+        &self.facts[..self.len]
+    }
+
+    /// The number of recorded deviations.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no deviation was tolerated at all.
+    ///
+    /// This is always the case when the parse ran with a strict (default)
+    /// configuration.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0 && self.dropped == 0
+    }
+
+    /// The number of deviations that did not fit into the provided buffer
+    /// and were therefore not recorded in [`Audit::facts`].
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    fn record(&mut self, category: RiskCategory, offset: usize, len: usize) {
+        if self.len < self.facts.len() {
+            self.facts[self.len] = IgnoredFact {
+                offset,
+                len,
+                category,
+            };
+            self.len += 1;
+        } else {
+            self.dropped += 1;
+        }
+    }
+}
+
+impl Audit<'static> {
+    /// An audit log that discards every recorded deviation.
+    ///
+    /// Used internally by the non-auditing parse entry points so the hot
+    /// path stays unchanged for callers that do not need an audit trail.
+    fn disabled() -> Audit<'static> {
+        Audit::new(&mut [])
+    }
+}
+
 /// Parser configuration.
 #[derive(Clone, Debug, Default)]
 pub struct ParserConfig {
@@ -349,7 +502,45 @@ impl ParserConfig {
         request: &mut Request<'_, 'buf>,
         buf: &'buf [u8],
     ) -> Result<usize> {
-        request.parse_with_config(buf, self)
+        request.parse_with_config(buf, self, &mut Audit::disabled())
+    }
+
+    /// Parses a request with the given config, recording every tolerated
+    /// deviation into `audit`.
+    ///
+    /// Behaves exactly like [`ParserConfig::parse_request`], but each time a
+    /// relaxed option causes input to be tolerated that a strict parser would
+    /// have rejected (or shaped differently), an [`IgnoredFact`] with the
+    /// matching [`RiskCategory`] is appended to `audit`. With a strict
+    /// (default) configuration the audit log stays empty.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let buf = b"GET  / HTTP/1.1\r\nHost: example.domain\r\n\r\n";
+    /// let mut headers = [httparse::EMPTY_HEADER; 16];
+    /// let mut req = httparse::Request::new(&mut headers);
+    /// let mut facts = [httparse::IgnoredFact {
+    ///     offset: 0,
+    ///     len: 0,
+    ///     category: httparse::RiskCategory::MultipleSpacesDelimiter,
+    /// }; 8];
+    /// let mut audit = httparse::Audit::new(&mut facts);
+    ///
+    /// let status = httparse::ParserConfig::default()
+    ///     .allow_multiple_spaces_in_request_line_delimiters(true)
+    ///     .parse_request_audited(&mut req, buf, &mut audit);
+    ///
+    /// assert_eq!(status, Ok(httparse::Status::Complete(buf.len())));
+    /// assert_eq!(audit.facts().len(), 1);
+    /// ```
+    pub fn parse_request_audited<'buf>(
+        &self,
+        request: &mut Request<'_, 'buf>,
+        buf: &'buf [u8],
+        audit: &mut Audit<'_>,
+    ) -> Result<usize> {
+        request.parse_with_config(buf, self, audit)
     }
 
     /// Parses a request with the given config and buffer for headers
@@ -359,7 +550,12 @@ impl ParserConfig {
         buf: &'buf [u8],
         headers: &'headers mut [MaybeUninit<Header<'buf>>],
     ) -> Result<usize> {
-        request.parse_with_config_and_uninit_headers(buf, self, headers)
+        request.parse_with_config_and_uninit_headers(
+            buf,
+            self,
+            headers,
+            &mut Audit::disabled(),
+        )
     }
 
     /// Sets whether invalid header lines should be silently ignored in responses.
@@ -415,7 +611,54 @@ impl ParserConfig {
         response: &mut Response<'_, 'buf>,
         buf: &'buf [u8],
     ) -> Result<usize> {
-        response.parse_with_config(buf, self)
+        response.parse_with_config(buf, self, &mut Audit::disabled())
+    }
+
+    /// Parses a response with the given config, recording every tolerated
+    /// deviation into `audit`.
+    ///
+    /// Behaves exactly like [`ParserConfig::parse_response`], but each time a
+    /// relaxed option causes input to be tolerated that a strict parser would
+    /// have rejected (or shaped differently), an [`IgnoredFact`] with the
+    /// matching [`RiskCategory`] is appended to `audit`. With a strict
+    /// (default) configuration the audit log stays empty.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let buf = b"HTTP/1.1 200 OK\r\nFolded: a\r\n b\r\nBad Header\r\n\r\n";
+    /// let mut headers = [httparse::EMPTY_HEADER; 16];
+    /// let mut res = httparse::Response::new(&mut headers);
+    /// let mut facts = [httparse::IgnoredFact {
+    ///     offset: 0,
+    ///     len: 0,
+    ///     category: httparse::RiskCategory::ObsoleteLineFolding,
+    /// }; 8];
+    /// let mut audit = httparse::Audit::new(&mut facts);
+    ///
+    /// let status = httparse::ParserConfig::default()
+    ///     .allow_obsolete_multiline_headers_in_responses(true)
+    ///     .ignore_invalid_headers_in_responses(true)
+    ///     .parse_response_audited(&mut res, buf, &mut audit);
+    ///
+    /// assert_eq!(status, Ok(httparse::Status::Complete(buf.len())));
+    /// assert_eq!(audit.facts().len(), 2);
+    /// assert_eq!(
+    ///     audit.facts()[0].category,
+    ///     httparse::RiskCategory::ObsoleteLineFolding
+    /// );
+    /// assert_eq!(
+    ///     audit.facts()[1].category,
+    ///     httparse::RiskCategory::InvalidHeaderSkipped
+    /// );
+    /// ```
+    pub fn parse_response_audited<'buf>(
+        &self,
+        response: &mut Response<'_, 'buf>,
+        buf: &'buf [u8],
+        audit: &mut Audit<'_>,
+    ) -> Result<usize> {
+        response.parse_with_config(buf, self, audit)
     }
 
     /// Parses a response with the given config and buffer for headers
@@ -425,7 +668,12 @@ impl ParserConfig {
         buf: &'buf [u8],
         headers: &'headers mut [MaybeUninit<Header<'buf>>],
     ) -> Result<usize> {
-        response.parse_with_config_and_uninit_headers(buf, self, headers)
+        response.parse_with_config_and_uninit_headers(
+            buf,
+            self,
+            headers,
+            &mut Audit::disabled(),
+        )
     }
 }
 
@@ -483,6 +731,7 @@ impl<'h, 'b> Request<'h, 'b> {
         buf: &'b [u8],
         config: &ParserConfig,
         mut headers: &'h mut [MaybeUninit<Header<'b>>],
+        audit: &mut Audit<'_>,
     ) -> Result<usize> {
         let orig_len = buf.len();
         let mut bytes = Bytes::new(buf);
@@ -490,11 +739,29 @@ impl<'h, 'b> Request<'h, 'b> {
         let method = complete!(parse_method(&mut bytes));
         self.method = Some(method);
         if config.allow_multiple_spaces_in_request_line_delimiters {
+            let spaces_start = orig_len - bytes.len();
             complete!(skip_spaces(&mut bytes));
+            let spaces_len = orig_len - bytes.len() - spaces_start;
+            if spaces_len > 0 {
+                audit.record(
+                    RiskCategory::MultipleSpacesDelimiter,
+                    spaces_start,
+                    spaces_len,
+                );
+            }
         }
         self.path = Some(complete!(parse_uri(&mut bytes)));
         if config.allow_multiple_spaces_in_request_line_delimiters {
+            let spaces_start = orig_len - bytes.len();
             complete!(skip_spaces(&mut bytes));
+            let spaces_len = orig_len - bytes.len() - spaces_start;
+            if spaces_len > 0 {
+                audit.record(
+                    RiskCategory::MultipleSpacesDelimiter,
+                    spaces_start,
+                    spaces_len,
+                );
+            }
         }
         self.version = Some(complete!(parse_version(&mut bytes)));
         newline!(bytes);
@@ -509,6 +776,8 @@ impl<'h, 'b> Request<'h, 'b> {
                 allow_space_before_first_header_name: config.allow_space_before_first_header_name,
                 ignore_invalid_headers: config.ignore_invalid_headers_in_requests
             },
+            len,
+            audit,
         ));
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
@@ -525,17 +794,27 @@ impl<'h, 'b> Request<'h, 'b> {
         buf: &'b [u8],
         headers: &'h mut [MaybeUninit<Header<'b>>],
     ) -> Result<usize> {
-        self.parse_with_config_and_uninit_headers(buf, &Default::default(), headers)
+        self.parse_with_config_and_uninit_headers(
+            buf,
+            &Default::default(),
+            headers,
+            &mut Audit::disabled(),
+        )
     }
 
-    fn parse_with_config(&mut self, buf: &'b [u8], config: &ParserConfig) -> Result<usize> {
+    fn parse_with_config(
+        &mut self,
+        buf: &'b [u8],
+        config: &ParserConfig,
+        audit: &mut Audit<'_>,
+    ) -> Result<usize> {
         let headers = mem::take(&mut self.headers);
 
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         unsafe {
             let headers: *mut [Header<'_>] = headers;
             let headers = headers as *mut [MaybeUninit<Header<'_>>];
-            match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers) {
+            match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers, audit) {
                 Ok(Status::Complete(idx)) => Ok(Status::Complete(idx)),
                 other => {
                     // put the original headers back
@@ -553,7 +832,7 @@ impl<'h, 'b> Request<'h, 'b> {
     /// In streaming code, if this returns `Status::Partial`, avoid retry loops
     /// on a growing buffer without size/time limits; CPU usage may grow fast.
     pub fn parse(&mut self, buf: &'b [u8]) -> Result<usize> {
-        self.parse_with_config(buf, &Default::default())
+        self.parse_with_config(buf, &Default::default(), &mut Audit::disabled())
     }
 }
 
@@ -634,10 +913,15 @@ impl<'h, 'b> Response<'h, 'b> {
     /// In streaming code, if this returns `Status::Partial`, avoid retry loops
     /// on a growing buffer without size/time limits; CPU usage may grow fast.
     pub fn parse(&mut self, buf: &'b [u8]) -> Result<usize> {
-        self.parse_with_config(buf, &ParserConfig::default())
+        self.parse_with_config(buf, &ParserConfig::default(), &mut Audit::disabled())
     }
 
-    fn parse_with_config(&mut self, buf: &'b [u8], config: &ParserConfig) -> Result<usize> {
+    fn parse_with_config(
+        &mut self,
+        buf: &'b [u8],
+        config: &ParserConfig,
+        audit: &mut Audit<'_>,
+    ) -> Result<usize> {
         let headers = mem::take(&mut self.headers);
 
         // SAFETY: see guarantees of [`parse_headers_iter_uninit`], which leaves no uninitialized
@@ -645,7 +929,7 @@ impl<'h, 'b> Response<'h, 'b> {
         unsafe {
             let headers: *mut [Header<'_>] = headers;
             let headers = headers as *mut [MaybeUninit<Header<'_>>];
-            match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers) {
+            match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers, audit) {
                 Ok(Status::Complete(idx)) => Ok(Status::Complete(idx)),
                 other => {
                     // put the original headers back
@@ -661,6 +945,7 @@ impl<'h, 'b> Response<'h, 'b> {
         buf: &'b [u8],
         config: &ParserConfig,
         mut headers: &'h mut [MaybeUninit<Header<'b>>],
+        audit: &mut Audit<'_>,
     ) -> Result<usize> {
         let orig_len = buf.len();
         let mut bytes = Bytes::new(buf);
@@ -669,7 +954,16 @@ impl<'h, 'b> Response<'h, 'b> {
         self.version = Some(complete!(parse_version(&mut bytes)));
         space!(bytes or Error::Version);
         if config.allow_multiple_spaces_in_response_status_delimiters {
+            let spaces_start = orig_len - bytes.len();
             complete!(skip_spaces(&mut bytes));
+            let spaces_len = orig_len - bytes.len() - spaces_start;
+            if spaces_len > 0 {
+                audit.record(
+                    RiskCategory::MultipleSpacesDelimiter,
+                    spaces_start,
+                    spaces_len,
+                );
+            }
         }
         self.code = Some(complete!(parse_code(&mut bytes)));
 
@@ -685,7 +979,16 @@ impl<'h, 'b> Response<'h, 'b> {
         match next!(bytes) {
             b' ' => {
                 if config.allow_multiple_spaces_in_response_status_delimiters {
+                    let spaces_start = orig_len - bytes.len();
                     complete!(skip_spaces(&mut bytes));
+                    let spaces_len = orig_len - bytes.len() - spaces_start;
+                    if spaces_len > 0 {
+                        audit.record(
+                            RiskCategory::MultipleSpacesDelimiter,
+                            spaces_start,
+                            spaces_len,
+                        );
+                    }
                 }
                 bytes.slice();
                 self.reason = Some(complete!(parse_reason(&mut bytes)));
@@ -712,7 +1015,9 @@ impl<'h, 'b> Response<'h, 'b> {
                 allow_obsolete_multiline_headers: config.allow_obsolete_multiline_headers_in_responses,
                 allow_space_before_first_header_name: config.allow_space_before_first_header_name,
                 ignore_invalid_headers: config.ignore_invalid_headers_in_responses
-            }
+            },
+            len,
+            audit,
         ));
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
@@ -964,7 +1269,13 @@ pub fn parse_headers<'b: 'h, 'h>(
     mut dst: &'h mut [Header<'b>],
 ) -> Result<(usize, &'h [Header<'b>])> {
     let mut iter = Bytes::new(src);
-    let pos = complete!(parse_headers_iter(&mut dst, &mut iter, &HeaderParserConfig::default()));
+    let pos = complete!(parse_headers_iter(
+        &mut dst,
+        &mut iter,
+        &HeaderParserConfig::default(),
+        0,
+        &mut Audit::disabled(),
+    ));
     Ok(Status::Complete((pos, dst)))
 }
 
@@ -973,12 +1284,16 @@ fn parse_headers_iter<'a>(
     headers: &mut &mut [Header<'a>],
     bytes: &mut Bytes<'a>,
     config: &HeaderParserConfig,
+    offset_base: usize,
+    audit: &mut Audit<'_>,
 ) -> Result<usize> {
     parse_headers_iter_uninit(
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         unsafe { deinit_slice_mut(headers) },
         bytes,
         config,
+        offset_base,
+        audit,
     )
 }
 
@@ -1013,7 +1328,9 @@ struct HeaderParserConfig {
 fn parse_headers_iter_uninit<'a>(
     headers: &mut &mut [MaybeUninit<Header<'a>>],
     bytes: &mut Bytes<'a>,
-    config: &HeaderParserConfig
+    config: &HeaderParserConfig,
+    offset_base: usize,
+    audit: &mut Audit<'_>,
 ) -> Result<usize> {
 
     /* Flow of this function is pretty complex, especially with macros,
@@ -1044,6 +1361,13 @@ fn parse_headers_iter_uninit<'a>(
     let start = bytes.as_ref().as_ptr() as usize;
     let mut result = Err(Error::TooManyHeaders);
 
+    // Absolute offset of the current cursor in the original buffer.
+    macro_rules! cursor_offset {
+        ($bytes:ident) => {
+            offset_base + ($bytes.as_ptr() as usize - start)
+        };
+    }
+
     let mut iter = autoshrink.headers.iter_mut();
 
     macro_rules! maybe_continue_after_obsolete_line_folding {
@@ -1057,6 +1381,11 @@ fn parse_headers_iter_uninit<'a>(
                         return Ok(Status::Partial);
                     }
                     Some(b' ') | Some(b'\t') => {
+                        audit.record(
+                            RiskCategory::ObsoleteLineFolding,
+                            cursor_offset!($bytes),
+                            1,
+                        );
                         // The space will be consumed next iteration.
                         continue $label;
                     }
@@ -1094,6 +1423,8 @@ fn parse_headers_iter_uninit<'a>(
                     && autoshrink.num_headers == 0
                     && (b == b' ' || b == b'\t')
                 {
+                    // `b` (the first whitespace byte) was already consumed.
+                    let whitespace_start = cursor_offset!(bytes) - 1;
                     //advance past white space and then try parsing header again
                     while let Some(peek) = bytes.peek() {
                         if peek == b' ' || peek == b'\t' {
@@ -1102,7 +1433,13 @@ fn parse_headers_iter_uninit<'a>(
                             break;
                         }
                     }
+                    let whitespace_len = cursor_offset!(bytes) - whitespace_start;
                     bytes.slice();
+                    audit.record(
+                        RiskCategory::SpaceBeforeFirstHeader,
+                        whitespace_start,
+                        whitespace_len,
+                    );
                     continue 'headers;
                 } else {
                     break 'header Error::HeaderName;
@@ -1126,11 +1463,20 @@ fn parse_headers_iter_uninit<'a>(
                 }
 
                 if config.allow_spaces_after_header_name {
+                    // `b` (the first whitespace byte) was already consumed.
+                    let whitespace_start = cursor_offset!(bytes) - 1;
                     while b == b' ' || b == b'\t' {
                         b = next!(bytes);
 
                         if b == b':' {
+                            let whitespace_len =
+                                cursor_offset!(bytes) - 1 - whitespace_start;
                             bytes.slice();
+                            audit.record(
+                                RiskCategory::SpaceAfterHeaderName,
+                                whitespace_start,
+                                whitespace_len,
+                            );
                             break 'name name;
                         }
                     }
@@ -1225,6 +1571,7 @@ fn parse_headers_iter_uninit<'a>(
             return Err(invalid_header_err);
         }
 
+        let skip_start = cursor_offset!(bytes);
         loop {
             if b == b'\r' {
                 expect!(bytes.next() == b'\n' => Err(invalid_header_err));
@@ -1238,7 +1585,13 @@ fn parse_headers_iter_uninit<'a>(
             }
             b = next!(bytes);
         }
+        let skip_len = cursor_offset!(bytes) - skip_start;
         bytes.slice();
+        audit.record(
+            RiskCategory::InvalidHeaderSkipped,
+            skip_start,
+            skip_len,
+        );
     }
 
     result
