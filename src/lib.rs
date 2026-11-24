@@ -25,7 +25,7 @@
 //! `-C target_cpu=native` allows the detection to become compile time checks,
 //! making it *even* faster.
 
-use core::{fmt, mem, result, str};
+use core::{fmt, mem, result, slice, str};
 use core::mem::MaybeUninit;
 
 use crate::iter::Bytes;
@@ -454,7 +454,7 @@ impl ParserConfig {
 ///     }
 /// }
 /// ```
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct Request<'headers, 'buf> {
     /// The request method, such as `GET`.
     pub method: Option<&'buf str>,
@@ -463,22 +463,71 @@ pub struct Request<'headers, 'buf> {
     /// The request minor version, such as `1` for `HTTP/1.1`.
     pub version: Option<u8>,
     /// The request headers.
-    pub headers: &'headers mut [Header<'buf>]
+    pub headers: &'headers mut [Header<'buf>],
+    /// Start address of the slice supplied to [`Request::new`].
+    header_start: usize,
+    /// Original capacity of the caller-provided header slice.
+    header_capacity: usize,
 }
+
+impl PartialEq for Request<'_, '_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.method == other.method
+            && self.path == other.path
+            && self.version == other.version
+            && self.headers == other.headers
+    }
+}
+
+impl Eq for Request<'_, '_> {}
 
 impl<'h, 'b> Request<'h, 'b> {
     /// Creates a new Request, using a slice of headers you allocate.
     #[inline]
     pub fn new(headers: &'h mut [Header<'b>]) -> Request<'h, 'b> {
+        let header_start = headers.as_mut_ptr() as usize;
+        let header_capacity = headers.len();
         Request {
             method: None,
             path: None,
             version: None,
             headers,
+            header_start,
+            header_capacity,
         }
     }
 
     fn parse_with_config_and_uninit_headers(
+        &mut self,
+        buf: &'b [u8],
+        config: &ParserConfig,
+        headers: &'h mut [MaybeUninit<Header<'b>>],
+    ) -> Result<usize> {
+        let identity_header_ptr = self.headers.as_mut_ptr();
+
+        // A new parse attempt must never publish scalar fields left behind by
+        // an earlier message. Partial progress can fill these again while the
+        // parser runs, but an error leaves no complete request identity.
+        self.method = None;
+        self.path = None;
+        self.version = None;
+
+        let result = self.parse_request_head(buf, config, headers);
+        if result.is_err() {
+            self.method = None;
+            self.path = None;
+            self.version = None;
+            // Keep allocation identity with a zero-length view rather than
+            // replacing it with an unrelated empty slice.
+            //
+            // SAFETY: the pointer was obtained from `self.headers` and is
+            // valid for zero elements. No other reference is live here.
+            self.headers = unsafe { slice::from_raw_parts_mut(identity_header_ptr, 0) };
+        }
+        result
+    }
+
+    fn parse_request_head(
         &mut self,
         buf: &'b [u8],
         config: &ParserConfig,
@@ -513,6 +562,25 @@ impl<'h, 'b> Request<'h, 'b> {
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
 
+        if !request_has_body_framing(self.headers) {
+            let consumed = len + headers_len;
+            if consumed < orig_len {
+                // Without body framing, bytes after the head are either a
+                // pipelined request or an unconfirmed fragment of one. Require
+                // the adjacent head to be complete. A complete pipeline head
+                // is not consumed into this request's offset; callers advance
+                // by `consumed` and parse it as the next message.
+                match ensure_adjacent_pipeline_head_is_complete(
+                    &buf[consumed..],
+                    config,
+                ) {
+                    Ok(Status::Complete(())) => {}
+                    Ok(Status::Partial) => return Err(Error::Token),
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
         Ok(Status::Complete(len + headers_len))
     }
 
@@ -529,19 +597,47 @@ impl<'h, 'b> Request<'h, 'b> {
     }
 
     fn parse_with_config(&mut self, buf: &'b [u8], config: &ParserConfig) -> Result<usize> {
-        let headers = mem::take(&mut self.headers);
+        let current_headers = mem::take(&mut self.headers);
+        let header_ptr = current_headers.as_mut_ptr();
+        let capacity = if header_ptr as usize == self.header_start {
+            self.header_capacity
+        } else {
+            // The public `headers` field may have been replaced by the caller.
+            // In that case only trust the length carried by that slice.
+            current_headers.len()
+        };
 
-        /* SAFETY: see `parse_headers_iter_uninit` guarantees */
+        // SAFETY: when the pointer matches the slice from `Request::new`,
+        // `header_capacity` is its original valid length. Otherwise `capacity`
+        // is exactly the length of `current_headers`, which remains owned for
+        // `'h` and is no longer aliased after `mem::take`.
         unsafe {
-            let headers: *mut [Header<'_>] = headers;
-            let headers = headers as *mut [MaybeUninit<Header<'_>>];
-            match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers) {
+            let uninit_headers: &'h mut [MaybeUninit<Header<'b>>] =
+                slice::from_raw_parts_mut(
+                    header_ptr.cast::<MaybeUninit<Header<'b>>>(),
+                    capacity,
+                );
+
+            // Clear entries left by a previous message before a partial parse
+            // can expose the caller's full header slice again.
+            for header in uninit_headers.iter_mut() {
+                header.write(EMPTY_HEADER);
+            }
+
+            match self.parse_with_config_and_uninit_headers(buf, config, uninit_headers) {
                 Ok(Status::Complete(idx)) => Ok(Status::Complete(idx)),
-                other => {
-                    // put the original headers back
-                    self.headers = &mut *(headers as *mut [Header<'_>]);
-                    other
-                },
+                Ok(Status::Partial) => {
+                    // Preserve the historical partial-parse view. Parsed slots
+                    // are initialized and every other slot was cleared above.
+                    self.headers = slice::from_raw_parts_mut(header_ptr, capacity);
+                    Ok(Status::Partial)
+                }
+                Err(err) => {
+                    // Keep the original allocation pointer with a zero-length
+                    // view so the parser can be reused after reporting an error.
+                    self.headers = slice::from_raw_parts_mut(header_ptr, 0);
+                    Err(err)
+                }
             }
         }
     }
@@ -554,6 +650,67 @@ impl<'h, 'b> Request<'h, 'b> {
     /// on a growing buffer without size/time limits; CPU usage may grow fast.
     pub fn parse(&mut self, buf: &'b [u8]) -> Result<usize> {
         self.parse_with_config(buf, &Default::default())
+    }
+}
+
+fn request_has_body_framing(headers: &[Header<'_>]) -> bool {
+    headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("content-length")
+            || header.name.eq_ignore_ascii_case("transfer-encoding")
+    })
+}
+
+/// Check that the adjacent pipelined request head in `tail` is complete.
+///
+/// This is a boundary check rather than a second published parse. It parses
+/// the request line with the primary parser's rules and then locates the end
+/// of the header block. The next call to [`Request::parse`] remains
+/// responsible for full header validation.
+fn ensure_adjacent_pipeline_head_is_complete(
+    tail: &[u8],
+    config: &ParserConfig,
+) -> Result<()> {
+    let mut bytes = Bytes::new(tail);
+
+    complete!(skip_empty_lines(&mut bytes));
+    complete!(parse_method(&mut bytes));
+    if config.allow_multiple_spaces_in_request_line_delimiters {
+        complete!(skip_spaces(&mut bytes));
+    }
+    complete!(parse_uri(&mut bytes));
+    if config.allow_multiple_spaces_in_request_line_delimiters {
+        complete!(skip_spaces(&mut bytes));
+    }
+    complete!(parse_version(&mut bytes));
+    newline!(bytes);
+
+    skip_to_header_block_end(&mut bytes)
+}
+
+#[inline]
+fn skip_to_header_block_end(bytes: &mut Bytes<'_>) -> Result<()> {
+    loop {
+        let b = next!(bytes);
+        if b == b'\r' {
+            expect!(bytes.next() == b'\n' => Err(Error::NewLine));
+            return Ok(Status::Complete(()));
+        }
+        if b == b'\n' {
+            return Ok(Status::Complete(()));
+        }
+
+        // Skip a non-empty header line. Its grammar is validated by the next
+        // full parse; here we only determine whether the blank terminator exists.
+        loop {
+            match next!(bytes) {
+                b'\r' => {
+                    expect!(bytes.next() == b'\n' => Err(Error::NewLine));
+                    break;
+                }
+                b'\n' => break,
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1794,6 +1951,87 @@ mod tests {
                 seg = &req_str[..i]
             );
         }
+    }
+
+    #[test]
+    fn trailing_unconfirmed_pipeline_fragment_is_rejected() {
+        let mut headers = [EMPTY_HEADER; 8];
+        let mut req = Request::new(&mut headers);
+
+        let result = req.parse(b"GET / HTTP/1.1\r\nHost: example\r\n\r\nG");
+        assert!(
+            matches!(
+                result,
+                Err(Error::NewLine) | Err(Error::Token) | Err(Error::Version)
+            ),
+            "unconfirmed trailing bytes were accepted: {result:?}"
+        );
+        assert_eq!(req.method, None);
+        assert_eq!(req.path, None);
+        assert_eq!(req.version, None);
+        assert!(req.headers.is_empty());
+    }
+
+    #[test]
+    fn rejected_pipeline_fragment_can_be_completed_on_retry() {
+        let mut headers = [EMPTY_HEADER; 8];
+        let mut req = Request::new(&mut headers);
+
+        assert!(req
+            .parse(b"GET /first HTTP/1.1\r\n\r\nG")
+            .is_err());
+
+        let buf = b"GET /first HTTP/1.1\r\n\r\nGET /second HTTP/1.1\r\n\r\n";
+        let first = req.parse(buf).unwrap().unwrap();
+        let second = req.parse(&buf[first..]).unwrap().unwrap();
+        assert_eq!(first + second, buf.len());
+        assert_eq!(req.path, Some("/second"));
+    }
+
+    #[test]
+    fn complete_pipelined_requests_parse_with_reused_parser() {
+        let mut headers = [EMPTY_HEADER; 8];
+        let mut req = Request::new(&mut headers);
+        let buf = b"GET /first HTTP/1.1\r\nHost: a\r\n\r\n\
+                    GET /second HTTP/1.0\r\nB: 2\r\nC: 3\r\n\r\n";
+
+        let first = req.parse(buf).unwrap().unwrap();
+        assert_eq!(req.path, Some("/first"));
+        assert_eq!(req.headers.len(), 1);
+
+        let second = req.parse(&buf[first..]).unwrap().unwrap();
+        assert_eq!(first + second, buf.len());
+        assert_eq!(req.method, Some("GET"));
+        assert_eq!(req.path, Some("/second"));
+        assert_eq!(req.version, Some(0));
+        assert_eq!(req.headers.len(), 2);
+    }
+
+    #[test]
+    fn body_after_content_length_is_not_treated_as_pipeline_fragment() {
+        let mut headers = [EMPTY_HEADER; 4];
+        let mut req = Request::new(&mut headers);
+        let buf = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+
+        let head = req.parse(buf).unwrap().unwrap();
+        assert_eq!(&buf[head..], b"hello");
+        assert_eq!(req.path, Some("/"));
+        assert_eq!(req.headers.len(), 1);
+    }
+
+    #[test]
+    fn reused_parser_clears_identity_before_partial_next_message() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers);
+        let first = b"GET /old HTTP/1.1\r\nOld: value\r\n\r\n";
+        req.parse(first).unwrap();
+
+        assert_eq!(req.parse(b"G"), Ok(Status::Partial));
+        assert_eq!(req.method, None);
+        assert_eq!(req.path, None);
+        assert_eq!(req.version, None);
+        assert_eq!(req.headers.len(), NUM_OF_HEADERS);
+        assert_eq!(req.headers[0].name, "");
     }
 
     static RESPONSE_WITH_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON: &[u8] =
