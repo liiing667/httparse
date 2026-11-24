@@ -1094,13 +1094,39 @@ fn parse_headers_iter_uninit<'a>(
                     && autoshrink.num_headers == 0
                     && (b == b' ' || b == b'\t')
                 {
-                    //advance past white space and then try parsing header again
+                    // Advance past the white space and then try parsing the
+                    // header again.
                     while let Some(peek) = bytes.peek() {
                         if peek == b' ' || peek == b'\t' {
                             next!(bytes);
                         } else {
                             break;
                         }
+                    }
+
+                    // The relaxed rule only permits white space *directly in
+                    // front of* the first header name. If the white space runs
+                    // to the end of the line, this is either the end of the
+                    // head or, when obsolete line folding is also enabled, an
+                    // orphaned continuation line with no header to attach to.
+                    // Silently skipping it would let a later branch (the
+                    // folding rule) swallow the failure and hide which
+                    // security boundary is still in force. Treat the input as
+                    // partial while the line is unfinished, and reject it with
+                    // a deterministic error once the line boundary is known,
+                    // so dangerous requests are never accepted.
+                    match bytes.peek() {
+                        None => return Ok(Status::Partial),
+                        Some(b'\r') => {
+                            next!(bytes);
+                            expect!(bytes.next() == b'\n' => Err(Error::HeaderName));
+                            return Err(Error::HeaderName);
+                        }
+                        Some(b'\n') => {
+                            next!(bytes);
+                            return Err(Error::HeaderName);
+                        }
+                        Some(_) => {}
                     }
                     bytes.slice();
                     continue 'headers;
@@ -2717,6 +2743,113 @@ mod tests {
         assert_eq!(response.headers.len(), 1);
         assert_eq!(response.headers[0].name, "Space-Before-Header");
         assert_eq!(response.headers[0].value, &b"hello there"[..]);
+    }
+
+    // A line made solely of white space before the first header is never a
+    // valid header: it is either an orphaned obsolete folding line (no header
+    // to continue) or a swallowed empty line. It must be rejected
+    // deterministically instead of being silently skipped, in particular when
+    // both relaxed rules are enabled.
+    static RESPONSE_WITH_WHITESPACE_ONLY_LINE_BEFORE_FIRST_HEADER: &[u8] =
+        b"HTTP/1.1 200 OK\r\n \r\nGood: v\r\n\r\n";
+
+    #[test]
+    fn test_reject_whitespace_only_line_with_space_before_first_header() {
+        let mut headers = [EMPTY_HEADER; 2];
+        let mut response = Response::new(&mut headers[..]);
+        let result = crate::ParserConfig::default()
+            .allow_space_before_first_header_name(true)
+            .parse_response(&mut response, RESPONSE_WITH_WHITESPACE_ONLY_LINE_BEFORE_FIRST_HEADER);
+
+        assert_eq!(result, Err(crate::Error::HeaderName));
+    }
+
+    #[test]
+    fn test_reject_whitespace_only_line_with_both_relaxed_options() {
+        let mut headers = [EMPTY_HEADER; 2];
+        let mut response = Response::new(&mut headers[..]);
+        let result = crate::ParserConfig::default()
+            .allow_space_before_first_header_name(true)
+            .allow_obsolete_multiline_headers_in_responses(true)
+            .parse_response(&mut response, RESPONSE_WITH_WHITESPACE_ONLY_LINE_BEFORE_FIRST_HEADER);
+
+        assert_eq!(result, Err(crate::Error::HeaderName));
+    }
+
+    #[test]
+    fn test_reject_whitespace_only_line_ending_head_with_both_relaxed_options() {
+        let mut headers = [EMPTY_HEADER; 2];
+        let mut response = Response::new(&mut headers[..]);
+        let result = crate::ParserConfig::default()
+            .allow_space_before_first_header_name(true)
+            .allow_obsolete_multiline_headers_in_responses(true)
+            .parse_response(&mut response, b"HTTP/1.1 200 OK\r\n \r\n\r\n");
+
+        assert_eq!(result, Err(crate::Error::HeaderName));
+    }
+
+    #[test]
+    fn test_partial_whitespace_only_line_with_both_relaxed_options() {
+        // While the white space line is not terminated it could still gain a
+        // header name, so it remains Partial rather than being rejected or
+        // accepted.
+        let mut config = crate::ParserConfig::default();
+        config
+            .allow_space_before_first_header_name(true)
+            .allow_obsolete_multiline_headers_in_responses(true);
+
+        for partial in [
+            &b"HTTP/1.1 200 OK\r\n "[..],
+            &b"HTTP/1.1 200 OK\r\n \r"[..],
+        ] {
+            let mut headers = [EMPTY_HEADER; 2];
+            let mut response = Response::new(&mut headers[..]);
+            let result = config.parse_response(&mut response, partial);
+            assert_eq!(result, Ok(Status::Partial), "input {partial:?}");
+        }
+    }
+
+    #[test]
+    fn test_reject_whitespace_only_line_in_request_with_space_before_first_header() {
+        let mut headers = [EMPTY_HEADER; 2];
+        let mut request = Request::new(&mut headers[..]);
+        let result = crate::ParserConfig::default()
+            .allow_space_before_first_header_name(true)
+            .parse_request(&mut request, b"GET / HTTP/1.1\r\n \r\nHost: x\r\n\r\n");
+
+        assert_eq!(result, Err(crate::Error::HeaderName));
+    }
+
+    #[test]
+    fn test_reject_whitespace_only_line_even_when_ignoring_invalid_headers() {
+        let mut headers = [EMPTY_HEADER; 2];
+        let mut response = Response::new(&mut headers[..]);
+        let result = crate::ParserConfig::default()
+            .allow_space_before_first_header_name(true)
+            .allow_obsolete_multiline_headers_in_responses(true)
+            .ignore_invalid_headers_in_responses(true)
+            .parse_response(&mut response, RESPONSE_WITH_WHITESPACE_ONLY_LINE_BEFORE_FIRST_HEADER);
+
+        assert_eq!(result, Err(crate::Error::HeaderName));
+    }
+
+    #[test]
+    fn test_both_relaxed_options_still_accept_valid_inputs() {
+        // White space directly in front of the first header name, followed by
+        // an actual header using obsolete line folding, must keep working when
+        // both compatibility options are enabled.
+        let buf = b"HTTP/1.1 200 OK\r\n Folded-Header: hello\r\n there\r\n\r\n";
+        let mut headers = [EMPTY_HEADER; 1];
+        let mut response = Response::new(&mut headers[..]);
+        let result = crate::ParserConfig::default()
+            .allow_space_before_first_header_name(true)
+            .allow_obsolete_multiline_headers_in_responses(true)
+            .parse_response(&mut response, buf);
+
+        assert_eq!(result, Ok(Status::Complete(buf.len())));
+        assert_eq!(response.headers.len(), 1);
+        assert_eq!(response.headers[0].name, "Folded-Header");
+        assert_eq!(response.headers[0].value, b"hello\r\n there");
     }
 
     #[test]
