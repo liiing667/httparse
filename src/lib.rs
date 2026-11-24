@@ -155,6 +155,41 @@ impl fmt::Display for InvalidChunkSize {
     }
 }
 
+/// The default maximum size, in bytes, of a chunked trailer section.
+///
+/// The limit includes the empty line that terminates the trailer section. It
+/// is used by [`parse_trailers`] when the caller does not need a different
+/// bound. A decoder should choose a bound that matches the resources it is
+/// willing to spend on trailers and pass it explicitly.
+pub const DEFAULT_MAX_TRAILER_BYTES: usize = 16 * 1024;
+
+/// An error in parsing a chunked trailer section.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TrailerError {
+    /// The trailer section did not terminate within the configured byte
+    /// budget.
+    ///
+    /// This is a fail-closed result: no trailer fields are returned, and the
+    /// caller must reject the message instead of waiting for or forwarding an
+    /// unbounded trailer section.
+    TooLarge,
+    /// The trailer section is complete within the byte budget, but it does not
+    /// contain valid header fields.
+    InvalidHeader(Error),
+}
+
+impl fmt::Display for TrailerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrailerError::TooLarge => f.write_str("trailer section is too large"),
+            TrailerError::InvalidHeader(err) => write!(f, "invalid trailer header: {err}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for TrailerError {}
+
 /// A Result of any parsing action.
 ///
 /// If the input is invalid, an `Error` will be returned. Note that incomplete
@@ -1249,6 +1284,24 @@ fn parse_headers_iter_uninit<'a>(
 /// The return value, if complete and successful, includes the index of the
 /// buffer that parsing stopped at, and the size of the following chunk.
 ///
+/// # Incremental input
+///
+/// `Status::Partial` means that the chunk-size line has not been seen in full
+/// yet. It never carries a position, and callers must not treat it as a
+/// completed (zero-sized) chunk or consume bytes from it. Keep the bytes and
+/// call this function again on the accumulated buffer when more data arrives.
+///
+/// Only a line containing at least one hexadecimal digit followed by `CRLF`
+/// completes. Chunk extensions may contain any printable or quoted octet, but
+/// control octets (other than the tab allowed by the grammar) are rejected, so
+/// that intermediate forwarding layers cannot disagree with this parser about
+/// where the line ends. A bare LF is a control octet here and is rejected as
+/// well; the line terminator must be `CRLF`.
+///
+/// After a zero-sized chunk, parse the following trailer fields with
+/// [`parse_trailers`] rather than unbounded header parsing, so that an
+/// oversized trailer section fails closed.
+///
 /// # Example
 ///
 /// ```
@@ -1295,7 +1348,16 @@ pub fn parse_chunk_size(buf: &[u8])
             }
             b'\r' => {
                 match next!(bytes) {
-                    b'\n' => break,
+                    b'\n' => {
+                        // A chunk-size line without a hexadecimal digit is not
+                        // a valid zero-sized chunk. Treating it as one would
+                        // let a forwarding layer end the body before the
+                        // chunk-size line is complete.
+                        if count == 0 {
+                            return Err(InvalidChunkSize);
+                        }
+                        break;
+                    }
                     _ => return Err(InvalidChunkSize),
                 }
             }
@@ -1309,12 +1371,23 @@ pub fn parse_chunk_size(buf: &[u8])
             b'\t' | b' ' if !in_ext && !in_chunk_size => {}
             // LWS can follow the chunk size, but no more digits can come
             b'\t' | b' ' if in_chunk_size => in_chunk_size = false,
-            // We allow any arbitrary octet once we are in the extension, since
-            // they all get ignored anyway. According to the HTTP spec, valid
-            // extensions would have a more strict syntax:
+            // We keep accepting arbitrary printable octets once we are in the
+            // extension, since they all get ignored anyway. According to the
+            // HTTP spec, valid extensions would have a more strict syntax:
             //     (token ["=" (token | quoted-string)])
             // but we gain nothing by rejecting an otherwise valid chunk size.
-            _ if in_ext => {}
+            //
+            // Control octets, however, are rejected. A NUL or a bare LF in an
+            // extension can be interpreted as a terminator by an intermediate
+            // layer, causing the forwarding layer and the final recipient to
+            // disagree about the chunk boundary. Horizontal tab is allowed
+            // because it is part of the optional whitespace around an
+            // extension.
+            _ if in_ext => {
+                if (b < 0x20 && b != b'\t') || b == 0x7f {
+                    return Err(InvalidChunkSize);
+                }
+            }
             // Finally, if we aren't in the extension and we're reading any
             // other octet, the chunk size line is invalid!
             _ => return Err(InvalidChunkSize),
@@ -1323,9 +1396,104 @@ pub fn parse_chunk_size(buf: &[u8])
     Ok(Status::Complete((bytes.pos(), size)))
 }
 
+/// Parse a bounded chunked trailer section.
+///
+/// `src` must start at the first trailer field and is expected to contain the
+/// empty line that terminates the trailer section. `max_bytes` is an inclusive
+/// upper bound on the number of bytes scanned for that terminator; passing
+/// [`DEFAULT_MAX_TRAILER_BYTES`] uses the crate's default. The bound is checked
+/// before any header field is parsed, so an oversized trailer cannot make the
+/// parser walk an unbounded amount of input.
+///
+/// On `Status::Complete`, the returned position includes the terminating empty
+/// line and `dst` contains exactly the trailer fields. On `Status::Partial`,
+/// the terminator has not arrived yet and `dst` must not be treated as
+/// containing committed trailer fields. On error, the message must be rejected;
+/// `dst` is unspecified and must not be consumed.
+///
+/// Duplicate trailer fields are preserved, matching the parser's ordinary
+/// header behaviour. A trailer section that contains more fields than `dst`
+/// can hold fails with [`TrailerError::InvalidHeader`] wrapping
+/// [`Error::TooManyHeaders`].
+///
+/// # Example
+///
+/// ```
+/// let buf = b"X-Trailer: value\r\n\r\n";
+/// let mut headers = [httparse::EMPTY_HEADER; 4];
+/// let status = httparse::parse_trailers(
+///     buf,
+///     &mut headers,
+///     httparse::DEFAULT_MAX_TRAILER_BYTES,
+/// );
+///
+/// let (pos, trailers) = status.unwrap().unwrap();
+/// assert_eq!(pos, buf.len());
+/// assert_eq!(trailers.len(), 1);
+/// assert_eq!(trailers[0].name, "X-Trailer");
+/// assert_eq!(trailers[0].value, b"value");
+/// ```
+pub fn parse_trailers<'b: 'h, 'h>(
+    src: &'b [u8],
+    dst: &'h mut [Header<'b>],
+    max_bytes: usize,
+) -> result::Result<Status<(usize, &'h [Header<'b>])>, TrailerError> {
+    let section_len = match find_trailer_section_end(src, max_bytes)? {
+        Some(section_len) => section_len,
+        None => return Ok(Status::Partial),
+    };
+
+    match parse_headers(&src[..section_len], dst) {
+        Ok(Status::Complete((pos, headers))) => Ok(Status::Complete((pos, headers))),
+        Ok(Status::Partial) => Ok(Status::Partial),
+        Err(err) => Err(TrailerError::InvalidHeader(err)),
+    }
+}
+
+/// Find the end of a trailer section without parsing its header fields.
+///
+/// The returned length includes the terminating empty line. `max_bytes` is an
+/// inclusive bound: a terminator that ends after `max_bytes` bytes is reported
+/// as [`TrailerError::TooLarge`].
+fn find_trailer_section_end(
+    src: &[u8],
+    max_bytes: usize,
+) -> result::Result<Option<usize>, TrailerError> {
+    let limit = core::cmp::min(src.len(), max_bytes);
+    let mut pos = 0;
+
+    while pos < limit {
+        let line_end = match src[pos..limit].iter().position(|b| *b == b'\n') {
+            Some(relative) => pos + relative + 1,
+            None => break,
+        };
+
+        // A line containing only CR, or nothing at all, terminates the
+        // trailer section. Anything else is a header field candidate.
+        let mut content_end = line_end - 1;
+        if content_end > pos && src[content_end - 1] == b'\r' {
+            content_end -= 1;
+        }
+        if content_end == pos {
+            return Ok(Some(line_end));
+        }
+
+        pos = line_end;
+    }
+
+    if src.len() >= max_bytes {
+        Err(TrailerError::TooLarge)
+    } else {
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Error, Request, Response, Status, EMPTY_HEADER, parse_chunk_size};
+    use super::{
+        parse_chunk_size, parse_trailers, Error, Request, Response, Status, TrailerError,
+        DEFAULT_MAX_TRAILER_BYTES, EMPTY_HEADER,
+    };
 
     const NUM_OF_HEADERS: usize = 4;
 
@@ -1999,6 +2167,217 @@ mod tests {
         assert_eq!(parse_chunk_size(b"1ffffffffffffffff\r\n"), Err(crate::InvalidChunkSize));
         assert_eq!(parse_chunk_size(b"Affffffffffffffff\r\n"), Err(crate::InvalidChunkSize));
         assert_eq!(parse_chunk_size(b"fffffffffffffffff\r\n"), Err(crate::InvalidChunkSize));
+    }
+
+    #[test]
+    fn test_chunk_size_requires_at_least_one_digit() {
+        assert_eq!(parse_chunk_size(b"\r\n"), Err(crate::InvalidChunkSize));
+        assert_eq!(parse_chunk_size(b";ext\r\n"), Err(crate::InvalidChunkSize));
+        assert_eq!(parse_chunk_size(b" ;ext\r\n"), Err(crate::InvalidChunkSize));
+    }
+
+    #[test]
+    fn test_chunk_size_rejects_control_octets_in_extension() {
+        // NUL is the representative smuggling byte: C string consumers may
+        // treat it as the end of the chunk-size line.
+        assert_eq!(
+            parse_chunk_size(b"1;\0not-a-token\r\n"),
+            Err(crate::InvalidChunkSize)
+        );
+
+        // A bare LF must not terminate (or be ignored inside) a chunk-size
+        // line; only CRLF is accepted.
+        assert_eq!(
+            parse_chunk_size(b"1;a\nb\r\n"),
+            Err(crate::InvalidChunkSize)
+        );
+
+        for byte in 0u8..=0x1f {
+            if byte == b'\t' || byte == b'\r' || byte == b'\n' {
+                continue;
+            }
+            let buf = [b'1', b';', byte, b'\r', b'\n'];
+            assert_eq!(
+                parse_chunk_size(&buf),
+                Err(crate::InvalidChunkSize),
+                "control octet {byte:#04x} was accepted in a chunk extension"
+            );
+        }
+
+        assert_eq!(
+            parse_chunk_size(b"1;\x7f\r\n"),
+            Err(crate::InvalidChunkSize)
+        );
+    }
+
+    #[test]
+    fn test_chunk_size_keeps_normal_extensions() {
+        assert_eq!(
+            parse_chunk_size(b"1;not-a-token\r\n"),
+            Ok(Status::Complete((15, 1)))
+        );
+        assert_eq!(
+            parse_chunk_size(b"1;foo=\"bar baz\"\r\n"),
+            Ok(Status::Complete((17, 1)))
+        );
+        assert_eq!(
+            parse_chunk_size(b"1;a\tb\r\n"),
+            Ok(Status::Complete((7, 1)))
+        );
+    }
+
+    /// The result for every prefix must agree with the result for the whole
+    /// line: a prefix may be `Partial`, but it may never report a complete
+    /// chunk earlier than the full line does. Invalid input must never produce
+    /// a complete result from any prefix.
+    fn assert_fragment_consistent(full: &[u8]) {
+        match parse_chunk_size(full) {
+            Ok(Status::Complete((full_pos, full_size))) => {
+                for split in 0..=full.len() {
+                    match parse_chunk_size(&full[..split]) {
+                        Ok(Status::Complete((pos, size))) => {
+                            assert!(
+                                split >= full_pos,
+                                "prefix of {split} bytes completed before {full_pos}"
+                            );
+                            assert_eq!(pos, full_pos);
+                            assert_eq!(size, full_size);
+                        }
+                        Ok(Status::Partial) => {
+                            assert!(
+                                split < full_pos,
+                                "prefix of {split} bytes was partial after completion"
+                            );
+                        }
+                        Err(err) => panic!(
+                            "valid prefix of {split} bytes was rejected: {err:?}"
+                        ),
+                    }
+                }
+            }
+            Ok(Status::Partial) => {
+                for split in 0..=full.len() {
+                    assert_eq!(parse_chunk_size(&full[..split]), Ok(Status::Partial));
+                }
+            }
+            Err(_) => {
+                for split in 0..=full.len() {
+                    assert!(
+                        !matches!(
+                            parse_chunk_size(&full[..split]),
+                            Ok(Status::Complete(_))
+                        ),
+                        "invalid input completed at split {split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunk_size_is_fragment_consistent() {
+        assert_fragment_consistent(b"0\r\n");
+        assert_fragment_consistent(b"12;foo bar*\r\n");
+        assert_fragment_consistent(b"3735ab1 ; baz \r\n");
+        assert_fragment_consistent(b"1;\0not-a-token\r\n");
+        assert_fragment_consistent(b"1;a\nb\r\n");
+        assert_fragment_consistent(b";ext\r\n");
+        assert_fragment_consistent(b"fffffffffffffffff\r\n");
+        assert_fragment_consistent(b"77a65\r");
+    }
+
+    #[test]
+    fn test_parse_trailers() {
+        let mut headers = [EMPTY_HEADER; 4];
+        let status = parse_trailers(
+            b"X-First: 1\r\nX-Second: 2\r\n\r\n",
+            &mut headers,
+            DEFAULT_MAX_TRAILER_BYTES,
+        );
+        let (pos, trailers) = status.unwrap().unwrap();
+        assert_eq!(pos, 27);
+        assert_eq!(trailers.len(), 2);
+        assert_eq!(trailers[0].name, "X-First");
+        assert_eq!(trailers[0].value, b"1");
+        assert_eq!(trailers[1].name, "X-Second");
+        assert_eq!(trailers[1].value, b"2");
+
+        // A terminal chunk may be followed by an empty trailer section.
+        let mut headers = [EMPTY_HEADER; 4];
+        assert_eq!(
+            parse_trailers(b"\r\n", &mut headers, DEFAULT_MAX_TRAILER_BYTES),
+            Ok(Status::Complete((2, &[][..])))
+        );
+
+        // LF-only line endings are accepted by the existing header parser and
+        // remain accepted for trailers.
+        let mut headers = [EMPTY_HEADER; 4];
+        let status = parse_trailers(b"X-Trailer: value\n\n", &mut headers, 1024);
+        let (pos, trailers) = status.unwrap().unwrap();
+        assert_eq!(pos, 18);
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(trailers[0].name, "X-Trailer");
+        assert_eq!(trailers[0].value, b"value");
+    }
+
+    #[test]
+    fn test_parse_trailers_keeps_duplicates() {
+        let mut headers = [EMPTY_HEADER; 4];
+        let status = parse_trailers(
+            b"X-Trailer: 1\r\nX-Trailer: 2\r\n\r\n",
+            &mut headers,
+            DEFAULT_MAX_TRAILER_BYTES,
+        );
+        let (_, trailers) = status.unwrap().unwrap();
+        assert_eq!(trailers.len(), 2);
+        assert_eq!(trailers[0].name, "X-Trailer");
+        assert_eq!(trailers[0].value, b"1");
+        assert_eq!(trailers[1].name, "X-Trailer");
+        assert_eq!(trailers[1].value, b"2");
+    }
+
+    #[test]
+    fn test_parse_trailers_partial_does_not_parse_headers() {
+        let mut headers = [EMPTY_HEADER; 4];
+        assert_eq!(
+            parse_trailers(b"X-Trailer: value\r\n", &mut headers, 1024),
+            Ok(Status::Partial)
+        );
+        assert_eq!(headers, [EMPTY_HEADER; 4]);
+    }
+
+    #[test]
+    fn test_parse_trailers_budget_is_enforced_before_parsing() {
+        let mut headers = [EMPTY_HEADER; 4];
+        assert_eq!(
+            parse_trailers(b"X-Trailer: value\r\n\r\n", &mut headers, 16),
+            Err(TrailerError::TooLarge)
+        );
+        assert_eq!(headers, [EMPTY_HEADER; 4]);
+
+        // The terminator ends exactly at the budget: this is allowed.
+        assert!(parse_trailers(b"X-Trailer: value\r\n\r\n", &mut headers, 20)
+            .unwrap()
+            .is_complete());
+    }
+
+    #[test]
+    fn test_parse_trailers_fails_closed_on_bad_headers_or_capacity() {
+        let mut headers = [EMPTY_HEADER; 4];
+        assert_eq!(
+            parse_trailers(b"Bad Header\r\n\r\n", &mut headers, 1024),
+            Err(TrailerError::InvalidHeader(Error::HeaderName))
+        );
+
+        let mut headers = [EMPTY_HEADER; 1];
+        assert_eq!(
+            parse_trailers(
+                b"X-Trailer: 1\r\nX-Trailer: 2\r\n\r\n",
+                &mut headers,
+                1024,
+            ),
+            Err(TrailerError::InvalidHeader(Error::TooManyHeaders))
+        );
     }
 
     static RESPONSE_WITH_MULTIPLE_SPACE_DELIMITERS: &[u8] =
