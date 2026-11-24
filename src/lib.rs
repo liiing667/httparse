@@ -205,6 +205,149 @@ impl<T> Status<T> {
     }
 }
 
+/// A report of which relaxed parsing rules were actually exercised while
+/// parsing a message.
+///
+/// By default httparse is strict: anything not explicitly allowed by the
+/// HTTP/1.x specifications is rejected. Several [`ParserConfig`] options
+/// relax that behavior for interoperability, but a plain
+/// `Ok(Status::Complete(..))` does not reveal whether those relaxations were
+/// actually needed for a given message. That makes it impossible for a
+/// caller (for example, an auditing proxy) to prove from its logs that the
+/// message it parsed was byte-for-byte the message the peer sent.
+///
+/// `Relaxations` closes that gap. Pass a `&mut Relaxations` to
+/// [`ParserConfig::parse_request_with_relaxations`] or
+/// [`ParserConfig::parse_response_with_relaxations`]; every time the parser
+/// accepts bytes that the strict parser would have rejected, the
+/// corresponding flag is set. A flag is only set when the relaxation is
+/// *exercised*: merely enabling an option in the config is not enough, the
+/// input must actually contain the relaxed construct. Conversely, a message
+/// that parses with `relaxations.any() == false` was accepted under the
+/// strict rules, regardless of which options were enabled.
+///
+/// The report is cumulative and is never cleared by the parser, so the same
+/// value can be reused across the `Partial` results of one message. Call
+/// [`Relaxations::clear`] before parsing an unrelated message.
+///
+/// # Example
+///
+/// ```rust
+/// let buf = b"GET  / HTTP/1.1\r\n\r\n";
+/// let mut headers = [httparse::EMPTY_HEADER; 16];
+/// let mut request = httparse::Request::new(&mut headers);
+/// let mut relaxations = httparse::Relaxations::default();
+///
+/// let res = httparse::ParserConfig::default()
+///     .allow_multiple_spaces_in_request_line_delimiters(true)
+///     .parse_request_with_relaxations(&mut request, buf, &mut relaxations);
+///
+/// assert_eq!(res, Ok(httparse::Status::Complete(buf.len())));
+/// assert!(relaxations.multiple_spaces_in_request_line());
+/// // This is exactly what an audit log needs:
+/// assert_eq!(relaxations.to_string(), "multiple spaces in request line");
+/// ```
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct Relaxations {
+    multiple_spaces_in_request_line: bool,
+    multiple_spaces_in_response_status_line: bool,
+    spaces_after_header_name: bool,
+    obsolete_multiline_headers: bool,
+    space_before_first_header_name: bool,
+    invalid_headers_ignored: bool,
+}
+
+impl Relaxations {
+    /// Whether any relaxed parsing rule was exercised at all.
+    ///
+    /// If this returns `false`, the parsed message was accepted under the
+    /// strict parsing rules, even if lenient options were enabled in the
+    /// [`ParserConfig`].
+    pub fn any(&self) -> bool {
+        self.multiple_spaces_in_request_line
+            || self.multiple_spaces_in_response_status_line
+            || self.spaces_after_header_name
+            || self.obsolete_multiline_headers
+            || self.space_before_first_header_name
+            || self.invalid_headers_ignored
+    }
+
+    /// Resets all flags, so the report can be reused for another message.
+    pub fn clear(&mut self) {
+        *self = Relaxations::default();
+    }
+
+    /// The request line used more than one space as a delimiter
+    /// (`allow_multiple_spaces_in_request_line_delimiters`).
+    pub fn multiple_spaces_in_request_line(&self) -> bool {
+        self.multiple_spaces_in_request_line
+    }
+
+    /// The response status line used more than one space as a delimiter
+    /// (`allow_multiple_spaces_in_response_status_delimiters`).
+    pub fn multiple_spaces_in_response_status_line(&self) -> bool {
+        self.multiple_spaces_in_response_status_line
+    }
+
+    /// A header had spaces or tabs between its name and the colon
+    /// (`allow_spaces_after_header_name_in_responses`).
+    pub fn spaces_after_header_name(&self) -> bool {
+        self.spaces_after_header_name
+    }
+
+    /// A header value used obsolete line folding
+    /// (`allow_obsolete_multiline_headers_in_responses`).
+    pub fn obsolete_multiline_headers(&self) -> bool {
+        self.obsolete_multiline_headers
+    }
+
+    /// Whitespace appeared before the first header name
+    /// (`allow_space_before_first_header_name`).
+    pub fn space_before_first_header_name(&self) -> bool {
+        self.space_before_first_header_name
+    }
+
+    /// At least one invalid header line was silently skipped
+    /// (`ignore_invalid_headers_in_requests` or
+    /// `ignore_invalid_headers_in_responses`).
+    pub fn invalid_headers_ignored(&self) -> bool {
+        self.invalid_headers_ignored
+    }
+
+    fn descriptions(&self) -> impl Iterator<Item = &'static str> {
+        [
+            (self.multiple_spaces_in_request_line, "multiple spaces in request line"),
+            (self.multiple_spaces_in_response_status_line, "multiple spaces in response status line"),
+            (self.spaces_after_header_name, "spaces after header name"),
+            (self.obsolete_multiline_headers, "obsolete multiline headers"),
+            (self.space_before_first_header_name, "space before first header name"),
+            (self.invalid_headers_ignored, "invalid headers ignored"),
+        ]
+        .into_iter()
+        .filter(|(set, _)| *set)
+        .map(|(_, description)| description)
+    }
+}
+
+impl fmt::Display for Relaxations {
+    /// A comma-separated list of the exercised relaxations, suitable for
+    /// audit logs. Prints `none` if no relaxation was exercised.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut descriptions = self.descriptions();
+        match descriptions.next() {
+            Some(first) => {
+                f.write_str(first)?;
+                for description in descriptions {
+                    f.write_str(", ")?;
+                    f.write_str(description)?;
+                }
+                Ok(())
+            }
+            None => f.write_str("none"),
+        }
+    }
+}
+
 /// Parser configuration.
 #[derive(Clone, Debug, Default)]
 pub struct ParserConfig {
@@ -352,6 +495,21 @@ impl ParserConfig {
         request.parse_with_config(buf, self)
     }
 
+    /// Parses a request with the given config, reporting which relaxations
+    /// were exercised.
+    ///
+    /// Behaves exactly like [`ParserConfig::parse_request`], but additionally
+    /// records in `relaxations` every relaxed parsing rule that was needed to
+    /// accept the input. See [`Relaxations`] for details.
+    pub fn parse_request_with_relaxations<'buf>(
+        &self,
+        request: &mut Request<'_, 'buf>,
+        buf: &'buf [u8],
+        relaxations: &mut Relaxations,
+    ) -> Result<usize> {
+        request.parse_with_config_and_relaxations(buf, self, relaxations)
+    }
+
     /// Parses a request with the given config and buffer for headers
     pub fn parse_request_with_uninit_headers<'headers, 'buf>(
         &self,
@@ -359,7 +517,29 @@ impl ParserConfig {
         buf: &'buf [u8],
         headers: &'headers mut [MaybeUninit<Header<'buf>>],
     ) -> Result<usize> {
-        request.parse_with_config_and_uninit_headers(buf, self, headers)
+        request.parse_with_config_and_uninit_headers(
+            buf,
+            self,
+            headers,
+            &mut Relaxations::default(),
+        )
+    }
+
+    /// Parses a request with the given config and buffer for headers,
+    /// reporting which relaxations were exercised.
+    ///
+    /// Behaves exactly like
+    /// [`ParserConfig::parse_request_with_uninit_headers`], but additionally
+    /// records in `relaxations` every relaxed parsing rule that was needed to
+    /// accept the input. See [`Relaxations`] for details.
+    pub fn parse_request_with_uninit_headers_and_relaxations<'headers, 'buf>(
+        &self,
+        request: &mut Request<'headers, 'buf>,
+        buf: &'buf [u8],
+        headers: &'headers mut [MaybeUninit<Header<'buf>>],
+        relaxations: &mut Relaxations,
+    ) -> Result<usize> {
+        request.parse_with_config_and_uninit_headers(buf, self, headers, relaxations)
     }
 
     /// Sets whether invalid header lines should be silently ignored in responses.
@@ -418,6 +598,21 @@ impl ParserConfig {
         response.parse_with_config(buf, self)
     }
 
+    /// Parses a response with the given config, reporting which relaxations
+    /// were exercised.
+    ///
+    /// Behaves exactly like [`ParserConfig::parse_response`], but additionally
+    /// records in `relaxations` every relaxed parsing rule that was needed to
+    /// accept the input. See [`Relaxations`] for details.
+    pub fn parse_response_with_relaxations<'buf>(
+        &self,
+        response: &mut Response<'_, 'buf>,
+        buf: &'buf [u8],
+        relaxations: &mut Relaxations,
+    ) -> Result<usize> {
+        response.parse_with_config_and_relaxations(buf, self, relaxations)
+    }
+
     /// Parses a response with the given config and buffer for headers
     pub fn parse_response_with_uninit_headers<'headers, 'buf>(
         &self,
@@ -425,7 +620,29 @@ impl ParserConfig {
         buf: &'buf [u8],
         headers: &'headers mut [MaybeUninit<Header<'buf>>],
     ) -> Result<usize> {
-        response.parse_with_config_and_uninit_headers(buf, self, headers)
+        response.parse_with_config_and_uninit_headers(
+            buf,
+            self,
+            headers,
+            &mut Relaxations::default(),
+        )
+    }
+
+    /// Parses a response with the given config and buffer for headers,
+    /// reporting which relaxations were exercised.
+    ///
+    /// Behaves exactly like
+    /// [`ParserConfig::parse_response_with_uninit_headers`], but additionally
+    /// records in `relaxations` every relaxed parsing rule that was needed to
+    /// accept the input. See [`Relaxations`] for details.
+    pub fn parse_response_with_uninit_headers_and_relaxations<'headers, 'buf>(
+        &self,
+        response: &mut Response<'headers, 'buf>,
+        buf: &'buf [u8],
+        headers: &'headers mut [MaybeUninit<Header<'buf>>],
+        relaxations: &mut Relaxations,
+    ) -> Result<usize> {
+        response.parse_with_config_and_uninit_headers(buf, self, headers, relaxations)
     }
 }
 
@@ -483,18 +700,23 @@ impl<'h, 'b> Request<'h, 'b> {
         buf: &'b [u8],
         config: &ParserConfig,
         mut headers: &'h mut [MaybeUninit<Header<'b>>],
+        relaxations: &mut Relaxations,
     ) -> Result<usize> {
         let orig_len = buf.len();
         let mut bytes = Bytes::new(buf);
         complete!(skip_empty_lines(&mut bytes));
         let method = complete!(parse_method(&mut bytes));
         self.method = Some(method);
-        if config.allow_multiple_spaces_in_request_line_delimiters {
-            complete!(skip_spaces(&mut bytes));
+        if config.allow_multiple_spaces_in_request_line_delimiters
+            && complete!(skip_spaces(&mut bytes)) > 0
+        {
+            relaxations.multiple_spaces_in_request_line = true;
         }
         self.path = Some(complete!(parse_uri(&mut bytes)));
-        if config.allow_multiple_spaces_in_request_line_delimiters {
-            complete!(skip_spaces(&mut bytes));
+        if config.allow_multiple_spaces_in_request_line_delimiters
+            && complete!(skip_spaces(&mut bytes)) > 0
+        {
+            relaxations.multiple_spaces_in_request_line = true;
         }
         self.version = Some(complete!(parse_version(&mut bytes)));
         newline!(bytes);
@@ -509,6 +731,7 @@ impl<'h, 'b> Request<'h, 'b> {
                 allow_space_before_first_header_name: config.allow_space_before_first_header_name,
                 ignore_invalid_headers: config.ignore_invalid_headers_in_requests
             },
+            relaxations,
         ));
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
@@ -525,17 +748,31 @@ impl<'h, 'b> Request<'h, 'b> {
         buf: &'b [u8],
         headers: &'h mut [MaybeUninit<Header<'b>>],
     ) -> Result<usize> {
-        self.parse_with_config_and_uninit_headers(buf, &Default::default(), headers)
+        self.parse_with_config_and_uninit_headers(
+            buf,
+            &Default::default(),
+            headers,
+            &mut Relaxations::default(),
+        )
     }
 
     fn parse_with_config(&mut self, buf: &'b [u8], config: &ParserConfig) -> Result<usize> {
+        self.parse_with_config_and_relaxations(buf, config, &mut Relaxations::default())
+    }
+
+    fn parse_with_config_and_relaxations(
+        &mut self,
+        buf: &'b [u8],
+        config: &ParserConfig,
+        relaxations: &mut Relaxations,
+    ) -> Result<usize> {
         let headers = mem::take(&mut self.headers);
 
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         unsafe {
             let headers: *mut [Header<'_>] = headers;
             let headers = headers as *mut [MaybeUninit<Header<'_>>];
-            match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers) {
+            match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers, relaxations) {
                 Ok(Status::Complete(idx)) => Ok(Status::Complete(idx)),
                 other => {
                     // put the original headers back
@@ -583,17 +820,19 @@ fn skip_empty_lines(bytes: &mut Bytes<'_>) -> Result<()> {
 }
 
 #[inline]
-fn skip_spaces(bytes: &mut Bytes<'_>) -> Result<()> {
+fn skip_spaces(bytes: &mut Bytes<'_>) -> Result<usize> {
+    let mut skipped = 0;
     loop {
         let b = bytes.peek();
         match b {
             Some(b' ') => {
                 // SAFETY: peeked and found ` `, so it's safe to bump 1 pos
                 unsafe { bytes.bump() };
+                skipped += 1;
             }
             Some(..) => {
                 bytes.slice();
-                return Ok(Status::Complete(()));
+                return Ok(Status::Complete(skipped));
             }
             None => return Ok(Status::Partial),
         }
@@ -638,6 +877,15 @@ impl<'h, 'b> Response<'h, 'b> {
     }
 
     fn parse_with_config(&mut self, buf: &'b [u8], config: &ParserConfig) -> Result<usize> {
+        self.parse_with_config_and_relaxations(buf, config, &mut Relaxations::default())
+    }
+
+    fn parse_with_config_and_relaxations(
+        &mut self,
+        buf: &'b [u8],
+        config: &ParserConfig,
+        relaxations: &mut Relaxations,
+    ) -> Result<usize> {
         let headers = mem::take(&mut self.headers);
 
         // SAFETY: see guarantees of [`parse_headers_iter_uninit`], which leaves no uninitialized
@@ -645,7 +893,7 @@ impl<'h, 'b> Response<'h, 'b> {
         unsafe {
             let headers: *mut [Header<'_>] = headers;
             let headers = headers as *mut [MaybeUninit<Header<'_>>];
-            match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers) {
+            match self.parse_with_config_and_uninit_headers(buf, config, &mut *headers, relaxations) {
                 Ok(Status::Complete(idx)) => Ok(Status::Complete(idx)),
                 other => {
                     // put the original headers back
@@ -661,6 +909,7 @@ impl<'h, 'b> Response<'h, 'b> {
         buf: &'b [u8],
         config: &ParserConfig,
         mut headers: &'h mut [MaybeUninit<Header<'b>>],
+        relaxations: &mut Relaxations,
     ) -> Result<usize> {
         let orig_len = buf.len();
         let mut bytes = Bytes::new(buf);
@@ -668,8 +917,10 @@ impl<'h, 'b> Response<'h, 'b> {
         complete!(skip_empty_lines(&mut bytes));
         self.version = Some(complete!(parse_version(&mut bytes)));
         space!(bytes or Error::Version);
-        if config.allow_multiple_spaces_in_response_status_delimiters {
-            complete!(skip_spaces(&mut bytes));
+        if config.allow_multiple_spaces_in_response_status_delimiters
+            && complete!(skip_spaces(&mut bytes)) > 0
+        {
+            relaxations.multiple_spaces_in_response_status_line = true;
         }
         self.code = Some(complete!(parse_code(&mut bytes)));
 
@@ -684,8 +935,10 @@ impl<'h, 'b> Response<'h, 'b> {
         // Anything else we'll say is a malformed status.
         match next!(bytes) {
             b' ' => {
-                if config.allow_multiple_spaces_in_response_status_delimiters {
-                    complete!(skip_spaces(&mut bytes));
+                if config.allow_multiple_spaces_in_response_status_delimiters
+                    && complete!(skip_spaces(&mut bytes)) > 0
+                {
+                    relaxations.multiple_spaces_in_response_status_line = true;
                 }
                 bytes.slice();
                 self.reason = Some(complete!(parse_reason(&mut bytes)));
@@ -712,7 +965,8 @@ impl<'h, 'b> Response<'h, 'b> {
                 allow_obsolete_multiline_headers: config.allow_obsolete_multiline_headers_in_responses,
                 allow_space_before_first_header_name: config.allow_space_before_first_header_name,
                 ignore_invalid_headers: config.ignore_invalid_headers_in_responses
-            }
+            },
+            relaxations,
         ));
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
@@ -964,7 +1218,12 @@ pub fn parse_headers<'b: 'h, 'h>(
     mut dst: &'h mut [Header<'b>],
 ) -> Result<(usize, &'h [Header<'b>])> {
     let mut iter = Bytes::new(src);
-    let pos = complete!(parse_headers_iter(&mut dst, &mut iter, &HeaderParserConfig::default()));
+    let pos = complete!(parse_headers_iter(
+        &mut dst,
+        &mut iter,
+        &HeaderParserConfig::default(),
+        &mut Relaxations::default(),
+    ));
     Ok(Status::Complete((pos, dst)))
 }
 
@@ -973,12 +1232,14 @@ fn parse_headers_iter<'a>(
     headers: &mut &mut [Header<'a>],
     bytes: &mut Bytes<'a>,
     config: &HeaderParserConfig,
+    relaxations: &mut Relaxations,
 ) -> Result<usize> {
     parse_headers_iter_uninit(
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         unsafe { deinit_slice_mut(headers) },
         bytes,
         config,
+        relaxations,
     )
 }
 
@@ -1013,7 +1274,8 @@ struct HeaderParserConfig {
 fn parse_headers_iter_uninit<'a>(
     headers: &mut &mut [MaybeUninit<Header<'a>>],
     bytes: &mut Bytes<'a>,
-    config: &HeaderParserConfig
+    config: &HeaderParserConfig,
+    relaxations: &mut Relaxations,
 ) -> Result<usize> {
 
     /* Flow of this function is pretty complex, especially with macros,
@@ -1057,6 +1319,9 @@ fn parse_headers_iter_uninit<'a>(
                         return Ok(Status::Partial);
                     }
                     Some(b' ') | Some(b'\t') => {
+                        // This header is using obsolete line folding, which
+                        // the strict parser would have rejected.
+                        relaxations.obsolete_multiline_headers = true;
                         // The space will be consumed next iteration.
                         continue $label;
                     }
@@ -1094,6 +1359,7 @@ fn parse_headers_iter_uninit<'a>(
                     && autoshrink.num_headers == 0
                     && (b == b' ' || b == b'\t')
                 {
+                    relaxations.space_before_first_header_name = true;
                     //advance past white space and then try parsing header again
                     while let Some(peek) = bytes.peek() {
                         if peek == b' ' || peek == b'\t' {
@@ -1127,6 +1393,7 @@ fn parse_headers_iter_uninit<'a>(
 
                 if config.allow_spaces_after_header_name {
                     while b == b' ' || b == b'\t' {
+                        relaxations.spaces_after_header_name = true;
                         b = next!(bytes);
 
                         if b == b':' {
@@ -1224,6 +1491,7 @@ fn parse_headers_iter_uninit<'a>(
         if !config.ignore_invalid_headers {
             return Err(invalid_header_err);
         }
+        relaxations.invalid_headers_ignored = true;
 
         loop {
             if b == b'\r' {
@@ -2077,6 +2345,192 @@ mod tests {
         assert_eq!(request.path.unwrap(), "/");
         assert_eq!(request.version.unwrap(), 1);
         assert_eq!(request.headers.len(), 0);
+    }
+
+    #[test]
+    fn test_relaxations_report_multiple_spaces_in_request_line() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut request = Request::new(&mut headers[..]);
+        let mut relaxations = crate::Relaxations::default();
+        let result = crate::ParserConfig::default()
+            .allow_multiple_spaces_in_request_line_delimiters(true)
+            .parse_request_with_relaxations(
+                &mut request,
+                REQUEST_WITH_MULTIPLE_SPACE_DELIMITERS,
+                &mut relaxations,
+            );
+
+        assert_eq!(result, Ok(Status::Complete(REQUEST_WITH_MULTIPLE_SPACE_DELIMITERS.len())));
+        assert!(relaxations.multiple_spaces_in_request_line());
+        assert!(relaxations.any());
+        assert_eq!(relaxations.to_string(), "multiple spaces in request line");
+    }
+
+    #[test]
+    fn test_relaxations_not_set_when_option_enabled_but_input_is_strict() {
+        // Enabling a lenient option must not, by itself, taint the report:
+        // only input that actually exercises the relaxation may set a flag.
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut request = Request::new(&mut headers[..]);
+        let mut relaxations = crate::Relaxations::default();
+        let result = crate::ParserConfig::default()
+            .allow_multiple_spaces_in_request_line_delimiters(true)
+            .allow_space_before_first_header_name(true)
+            .ignore_invalid_headers_in_requests(true)
+            .parse_request_with_relaxations(
+                &mut request,
+                b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                &mut relaxations,
+            );
+
+        assert!(result.unwrap().is_complete());
+        assert!(!relaxations.any());
+        assert_eq!(relaxations.to_string(), "none");
+    }
+
+    #[test]
+    fn test_relaxations_report_multiple_spaces_in_response_status_line() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut response = Response::new(&mut headers[..]);
+        let mut relaxations = crate::Relaxations::default();
+        let result = crate::ParserConfig::default()
+            .allow_multiple_spaces_in_response_status_delimiters(true)
+            .parse_response_with_relaxations(
+                &mut response,
+                RESPONSE_WITH_MULTIPLE_SPACE_DELIMITERS,
+                &mut relaxations,
+            );
+
+        assert_eq!(result, Ok(Status::Complete(RESPONSE_WITH_MULTIPLE_SPACE_DELIMITERS.len())));
+        assert!(relaxations.multiple_spaces_in_response_status_line());
+        assert!(relaxations.any());
+    }
+
+    #[test]
+    fn test_relaxations_report_obsolete_multiline_headers() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut response = Response::new(&mut headers[..]);
+        let mut relaxations = crate::Relaxations::default();
+        let result = crate::ParserConfig::default()
+            .allow_obsolete_multiline_headers_in_responses(true)
+            .parse_response_with_relaxations(
+                &mut response,
+                b"HTTP/1.1 200 OK\r\nFolded: hello\r\n there\r\n\r\n",
+                &mut relaxations,
+            );
+
+        assert!(result.unwrap().is_complete());
+        assert!(relaxations.obsolete_multiline_headers());
+        assert!(!relaxations.spaces_after_header_name());
+    }
+
+    #[test]
+    fn test_relaxations_report_spaces_after_header_name() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut response = Response::new(&mut headers[..]);
+        let mut relaxations = crate::Relaxations::default();
+        let result = crate::ParserConfig::default()
+            .allow_spaces_after_header_name_in_responses(true)
+            .parse_response_with_relaxations(
+                &mut response,
+                b"HTTP/1.1 200 OK\r\nHost : example.com\r\n\r\n",
+                &mut relaxations,
+            );
+
+        assert!(result.unwrap().is_complete());
+        assert!(relaxations.spaces_after_header_name());
+        assert!(relaxations.any());
+    }
+
+    #[test]
+    fn test_relaxations_report_space_before_first_header_name() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut request = Request::new(&mut headers[..]);
+        let mut relaxations = crate::Relaxations::default();
+        let result = crate::ParserConfig::default()
+            .allow_space_before_first_header_name(true)
+            .parse_request_with_relaxations(
+                &mut request,
+                b"GET / HTTP/1.1\r\n Host: example.com\r\n\r\n",
+                &mut relaxations,
+            );
+
+        assert!(result.unwrap().is_complete());
+        assert!(relaxations.space_before_first_header_name());
+        assert_eq!(request.headers[0].name, "Host");
+    }
+
+    #[test]
+    fn test_relaxations_report_ignored_invalid_headers() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut response = Response::new(&mut headers[..]);
+        let mut relaxations = crate::Relaxations::default();
+        let result = crate::ParserConfig::default()
+            .ignore_invalid_headers_in_responses(true)
+            .parse_response_with_relaxations(
+                &mut response,
+                b"HTTP/1.1 200 OK\r\nBroken Header\r\nHost: example.com\r\n\r\n",
+                &mut relaxations,
+            );
+
+        assert!(result.unwrap().is_complete());
+        assert!(relaxations.invalid_headers_ignored());
+        assert_eq!(response.headers.len(), 1);
+        assert_eq!(response.headers[0].name, "Host");
+    }
+
+    #[test]
+    fn test_relaxations_accumulate_across_partial_parses() {
+        // The report is cumulative so a caller reassembling a message from
+        // Partial results keeps every relaxation observed along the way.
+        let mut relaxations = crate::Relaxations::default();
+        let config = crate::ParserConfig::default()
+            .allow_multiple_spaces_in_request_line_delimiters(true)
+            .clone();
+
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut request = Request::new(&mut headers[..]);
+        let first = config.parse_request_with_relaxations(
+            &mut request,
+            b"GET  / HTTP/1.1\r\n",
+            &mut relaxations,
+        );
+        assert_eq!(first, Ok(Status::Partial));
+        assert!(relaxations.multiple_spaces_in_request_line());
+
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut request = Request::new(&mut headers[..]);
+        let second = config.parse_request_with_relaxations(
+            &mut request,
+            b"GET  / HTTP/1.1\r\n\r\n",
+            &mut relaxations,
+        );
+        assert!(second.unwrap().is_complete());
+        assert!(relaxations.multiple_spaces_in_request_line());
+
+        relaxations.clear();
+        assert!(!relaxations.any());
+    }
+
+    #[test]
+    fn test_relaxations_display_lists_all_exercised() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut response = Response::new(&mut headers[..]);
+        let mut relaxations = crate::Relaxations::default();
+        let result = crate::ParserConfig::default()
+            .allow_multiple_spaces_in_response_status_delimiters(true)
+            .allow_obsolete_multiline_headers_in_responses(true)
+            .parse_response_with_relaxations(
+                &mut response,
+                b"HTTP/1.1  200 OK\r\nFolded: hello\r\n there\r\n\r\n",
+                &mut relaxations,
+            );
+
+        assert!(result.unwrap().is_complete());
+        assert_eq!(
+            relaxations.to_string(),
+            "multiple spaces in response status line, obsolete multiline headers"
+        );
     }
 
     /// This is technically allowed by the spec, but we only support multiple spaces as an option,
