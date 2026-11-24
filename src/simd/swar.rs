@@ -105,7 +105,13 @@ fn match_block(f: impl Fn(u8) -> bool, block: ByteBlock) -> usize {
 
 // creates a u64 whose bytes are each equal to b
 const fn uniform_block(b: u8) -> usize {
-    usize::from_ne_bytes([b; BLOCK_SIZE])
+    // The SWAR arithmetic below relies on subtraction borrows propagating
+    // from a byte toward the *next* byte.  That only matches the memory order
+    // of the block on a little-endian host, where the first byte is the least
+    // significant.  Feeding the block through the little-endian
+    // (de)serialization everywhere keeps the two scan paths (SWAR and the
+    // vector backends) equivalent on big-endian targets as well.
+    usize::from_le_bytes([b; BLOCK_SIZE])
 }
 
 // A byte-wise range-check on an entire word/block,
@@ -123,7 +129,9 @@ fn match_uri_char_8_swar(block: ByteBlock) -> usize {
     // uniform block full of 128.
     const M128: usize = uniform_block(128);
 
-    let x = usize::from_ne_bytes(block); // Really just a transmute
+    // Interpret the block as a little-endian word so that borrow/carry flows
+    // between adjacent bytes follow their order in the caller's buffer.
+    let x = usize::from_le_bytes(block);
     let lt = x.wrapping_sub(BM) & !x; // <= m
 
     let xor_del = x ^ DEL;
@@ -147,7 +155,8 @@ fn match_header_value_char_8_swar(block: ByteBlock) -> usize {
     // uniform block full of 128.
     const M128: usize = uniform_block(128);
 
-    let x = usize::from_ne_bytes(block); // Really just a transmute
+    // See `match_uri_char_8_swar` for why the block is read as little-endian.
+    let x = usize::from_le_bytes(block);
     let lt = x.wrapping_sub(BM) & !x; // <= m
 
     let xor_del = x ^ DEL;
@@ -166,7 +175,7 @@ fn offsetnz(block: usize) -> usize {
     }
 
     // perf: rust will unroll this loop
-    for (i, b) in block.to_ne_bytes().iter().copied().enumerate() {
+    for (i, b) in block.to_le_bytes().iter().copied().enumerate() {
         if b != 0 {
             return i;
         }
@@ -228,7 +237,79 @@ fn test_offsetnz() {
     for i in 0..BLOCK_SIZE {
         let mut seq = seq;
         seq[i] = 1;
-        let x = usize::from_ne_bytes(seq);
+        // `offsetnz` indexes bytes in little-endian (memory) order, so build
+        // the probe word the same way to stay correct on every endianness.
+        let x = usize::from_le_bytes(seq);
         assert_eq!(offsetnz(x), i);
     }
+}
+
+// The SWAR word math uses subtraction, whose borrow can spill into a
+// neighboring byte.  On a big-endian host that borrow points toward an
+// *earlier* byte in the caller's buffer, which previously made the generic
+// scan reject bytes that the vector backends (SSE4.2/AVX2/NEON) accept.
+// Exhaustively checking every adjacent byte pair keeps both scan paths in
+// sync regardless of target endianness.
+#[test]
+fn test_uri_block_matches_scalar_for_all_byte_pairs() {
+    for first in 0..=u8::MAX {
+        for second in 0..=u8::MAX {
+            let mut block = [b'a'; BLOCK_SIZE];
+            block[0] = first;
+            block[1] = second;
+
+            let expected = block
+                .iter()
+                .position(|&b| !is_uri_token(b))
+                .unwrap_or(BLOCK_SIZE);
+
+            assert_eq!(
+                match_uri_char_8_swar(block),
+                expected,
+                "first={first:#x}, second={second:#x}",
+            );
+        }
+    }
+}
+
+#[test]
+fn test_header_value_block_matches_scalar_for_all_byte_pairs() {
+    for first in 0..=u8::MAX {
+        for second in 0..=u8::MAX {
+            let mut block = [b'a'; BLOCK_SIZE];
+            block[0] = first;
+            block[1] = second;
+
+            // TAB (0x09) is only recognized by the scalar tail in
+            // `match_header_value_vectored`, so the block matcher treats it
+            // like every other byte below the lower bound.
+            let block_predicate = |b: u8| b >= 0x20 && b != 0x7F;
+            let expected = block
+                .iter()
+                .position(|&b| !block_predicate(b))
+                .unwrap_or(BLOCK_SIZE);
+
+            assert_eq!(
+                match_header_value_char_8_swar(block),
+                expected,
+                "first={first:#x}, second={second:#x}",
+            );
+        }
+    }
+}
+
+// End-to-end guarantee: a URI containing a low/control byte later in the
+// block must stop exactly at that byte, never at an earlier valid byte.
+// This is the concrete divergence reported between vector and generic scans.
+#[test]
+fn test_uri_vectored_does_not_falsely_reject_earlier_valid_bytes() {
+    // First byte is the lowest valid URI char (`!` = 0x21); the second is
+    // invalid.  Big-endian SWAR used to report offset 0 instead of 1 here.
+    let mut block = [b'a'; BLOCK_SIZE * 2 + 2];
+    block[0] = b'!';
+    block[1] = b' ';
+
+    let mut bytes = crate::Bytes::new(&block);
+    match_uri_vectored(&mut bytes);
+    assert_eq!(bytes.pos(), 1);
 }
