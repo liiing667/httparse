@@ -114,12 +114,20 @@ pub enum Error {
     TooManyHeaders,
     /// Invalid byte in HTTP version.
     Version,
+    /// The message length is ambiguous.
+    ///
+    /// Returned when a parsed head contains both `Content-Length` and
+    /// `Transfer-Encoding`, or carries conflicting `Content-Length`
+    /// values. In either case different agents could compute different
+    /// message boundaries, so the head is rejected before it is exposed.
+    AmbiguousLength,
 }
 
 impl Error {
     #[inline]
     fn description_str(&self) -> &'static str {
         match *self {
+            Error::AmbiguousLength => "ambiguous message length",
             Error::HeaderName => "invalid header name",
             Error::HeaderValue => "invalid header value",
             Error::NewLine => "invalid new line",
@@ -511,7 +519,13 @@ impl<'h, 'b> Request<'h, 'b> {
             },
         ));
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
-        self.headers = unsafe { assume_init_slice(headers) };
+        let headers = unsafe { assume_init_slice(headers) };
+        // Accept the head only once its message boundary is unambiguous.
+        // The check runs on the headers parsed in *this* pass, so a reused
+        // header buffer can never leak a previous message's length rules
+        // into the current one.
+        validate_message_length(headers)?;
+        self.headers = headers;
 
         Ok(Status::Complete(len + headers_len))
     }
@@ -715,7 +729,13 @@ impl<'h, 'b> Response<'h, 'b> {
             }
         ));
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
-        self.headers = unsafe { assume_init_slice(headers) };
+        let headers = unsafe { assume_init_slice(headers) };
+        // Accept the head only once its message boundary is unambiguous.
+        // The check runs on the headers parsed in *this* pass, so a reused
+        // header buffer can never leak a previous message's length rules
+        // into the current one.
+        validate_message_length(headers)?;
+        self.headers = headers;
         Ok(Status::Complete(len + headers_len))
     }
 }
@@ -999,6 +1019,69 @@ struct HeaderParserConfig {
     allow_obsolete_multiline_headers: bool,
     allow_space_before_first_header_name: bool,
     ignore_invalid_headers: bool,
+}
+
+/// Checks that a fully parsed head carries exactly one message-length
+/// signal, so that every agent downstream computes the same message
+/// boundary.
+///
+/// Returns `Error::AmbiguousLength` when `Content-Length` and
+/// `Transfer-Encoding` appear together, or when `Content-Length` values
+/// disagree with each other (whether repeated field lines or a
+/// comma-separated list on a single line). Identical duplicates and
+/// `Transfer-Encoding` on its own (e.g. normal chunked messages) are
+/// accepted.
+///
+/// This must only be called with the headers parsed in the *current*
+/// pass, never with a caller-provided buffer that may still hold stale
+/// entries from a previously parsed message.
+fn validate_message_length(headers: &[Header<'_>]) -> result::Result<(), Error> {
+    let mut content_length: Option<&[u8]> = None;
+    let mut transfer_encoding = false;
+
+    for header in headers {
+        if header.name.eq_ignore_ascii_case("content-length") {
+            // A single field line may carry a comma-separated list of
+            // values; every value, on every line, must agree.
+            for value in header.value.split(|&b| b == b',') {
+                let value = trim_ows(value);
+                match content_length {
+                    Some(previous) if previous != value => {
+                        return Err(Error::AmbiguousLength);
+                    }
+                    _ => content_length = Some(value),
+                }
+            }
+        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding = true;
+        }
+    }
+
+    if transfer_encoding && content_length.is_some() {
+        return Err(Error::AmbiguousLength);
+    }
+
+    Ok(())
+}
+
+/// Trims optional whitespace (spaces and tabs) from both ends of a header
+/// value fragment.
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while let Some((&first, rest)) = value.split_first() {
+        if first == b' ' || first == b'\t' {
+            value = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((&last, rest)) = value.split_last() {
+        if last == b' ' || last == b'\t' {
+            value = rest;
+        } else {
+            break;
+        }
+    }
+    value
 }
 
 /* Function which parsers headers into uninitialized buffer.
@@ -1380,6 +1463,105 @@ mod tests {
             assert_eq!(req.version.unwrap(), 1);
             assert_eq!(req.headers.len(), 0);
         }
+    }
+
+    #[test]
+    fn test_request_content_length_and_transfer_encoding_is_rejected() {
+        // Both length signals at once: two different message boundaries.
+        let buf = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+        assert_eq!(req.parse(buf), Err(Error::AmbiguousLength));
+
+        // Order and header-name case do not matter.
+        let buf = b"POST / HTTP/1.1\r\ntransfer-encoding: chunked\r\ncontent-length: 5\r\n\r\n";
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+        assert_eq!(req.parse(buf), Err(Error::AmbiguousLength));
+    }
+
+    #[test]
+    fn test_response_content_length_and_transfer_encoding_is_rejected() {
+        let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut res = Response::new(&mut headers[..]);
+        assert_eq!(res.parse(buf), Err(Error::AmbiguousLength));
+    }
+
+    #[test]
+    fn test_conflicting_content_lengths_are_rejected() {
+        // Repeated field lines that disagree.
+        let buf = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n";
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+        assert_eq!(req.parse(buf), Err(Error::AmbiguousLength));
+
+        // A comma-separated list whose values disagree.
+        let buf = b"POST / HTTP/1.1\r\nContent-Length: 5, 6\r\n\r\n";
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+        assert_eq!(req.parse(buf), Err(Error::AmbiguousLength));
+    }
+
+    req! {
+        test_duplicate_content_length_with_same_value_is_accepted,
+        b"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n",
+        |req| {
+            assert_eq!(req.headers.len(), 2);
+            assert_eq!(req.headers[0].name, "Content-Length");
+            assert_eq!(req.headers[0].value, b"5");
+            assert_eq!(req.headers[1].value, b"5");
+        }
+    }
+
+    req! {
+        test_content_length_list_with_same_value_is_accepted,
+        b"POST / HTTP/1.1\r\nContent-Length: 5, 5\r\n\r\n",
+        |req| {
+            assert_eq!(req.headers.len(), 1);
+            assert_eq!(req.headers[0].value, b"5, 5");
+        }
+    }
+
+    req! {
+        test_chunked_and_duplicate_headers_are_accepted,
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nX-Multi: a\r\nX-Multi: b\r\n\r\n",
+        |req| {
+            assert_eq!(req.headers.len(), 3);
+            assert_eq!(req.headers[0].name, "Transfer-Encoding");
+            assert_eq!(req.headers[0].value, b"chunked");
+            assert_eq!(req.headers[1].value, b"a");
+            assert_eq!(req.headers[2].value, b"b");
+        }
+    }
+
+    #[test]
+    fn test_incremental_parse_validates_only_current_message() {
+        // A stale `Content-Length` left in the header buffer by a previous
+        // message must not be treated as part of the current one.
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+
+        let first = b"POST /one HTTP/1.1\r\nContent-Length: 4\r\n\r\n";
+        assert_eq!(req.parse(first), Ok(Status::Complete(first.len())));
+        assert_eq!(req.headers.len(), 1);
+
+        // The next message is chunked only; the leftover Content-Length
+        // slot from the previous parse must not cause a rejection.
+        let second = b"POST /two HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(req.parse(second), Ok(Status::Complete(second.len())));
+        assert_eq!(req.headers.len(), 1);
+        assert_eq!(req.headers[0].name, "Transfer-Encoding");
+
+        // Partial heads are not validated until the boundary is confirmed:
+        // a prefix of an ambiguous head yields Partial, and the completed
+        // head is rejected.
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+        let prefix = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encod";
+        assert_eq!(req.parse(prefix), Ok(Status::Partial));
+        let full = b"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert_eq!(req.parse(full), Err(Error::AmbiguousLength));
     }
 
     req! {
