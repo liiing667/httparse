@@ -602,7 +602,10 @@ fn skip_spaces(bytes: &mut Bytes<'_>) -> Result<()> {
 
 /// A parsed Response.
 ///
-/// See `Request` docs for explanation of optional values.
+/// The optional values are only published once a response has been parsed
+/// completely. A `Status::Partial` or an error leaves all status-line values
+/// as `None`, so a reused `Response` never exposes fields from a previous
+/// message or from an incomplete attempt.
 #[derive(Debug, Eq, PartialEq)]
 pub struct Response<'headers, 'buf> {
     /// The response minor version, such as `1` for `HTTP/1.1`.
@@ -665,13 +668,21 @@ impl<'h, 'b> Response<'h, 'b> {
         let orig_len = buf.len();
         let mut bytes = Bytes::new(buf);
 
+        // Nothing from a previous message, and nothing staged in this pass,
+        // may be visible until the whole response head has parsed. Staging
+        // the status-line values in locals also means a partial response or
+        // an error cannot leave a usable status behind.
+        self.version = None;
+        self.code = None;
+        self.reason = None;
+
         complete!(skip_empty_lines(&mut bytes));
-        self.version = Some(complete!(parse_version(&mut bytes)));
+        let version = complete!(parse_version(&mut bytes));
         space!(bytes or Error::Version);
         if config.allow_multiple_spaces_in_response_status_delimiters {
             complete!(skip_spaces(&mut bytes));
         }
-        self.code = Some(complete!(parse_code(&mut bytes)));
+        let code = complete!(parse_code(&mut bytes));
 
         // RFC7230 says there must be 'SP' and then reason-phrase, but admits
         // its only for legacy reasons. With the reason-phrase completely
@@ -682,25 +693,25 @@ impl<'h, 'b> Response<'h, 'b> {
         // So, a SP means parse a reason-phrase.
         // A newline means go to headers.
         // Anything else we'll say is a malformed status.
-        match next!(bytes) {
+        let reason = match next!(bytes) {
             b' ' => {
                 if config.allow_multiple_spaces_in_response_status_delimiters {
                     complete!(skip_spaces(&mut bytes));
                 }
                 bytes.slice();
-                self.reason = Some(complete!(parse_reason(&mut bytes)));
+                complete!(parse_reason(&mut bytes))
             },
             b'\r' => {
                 expect!(bytes.next() == b'\n' => Err(Error::Status));
                 bytes.slice();
-                self.reason = Some("");
+                ""
             },
             b'\n' => {
                 bytes.slice();
-                self.reason = Some("");
+                ""
             }
             _ => return Err(Error::Status),
-        }
+        };
 
 
         let len = orig_len - bytes.len();
@@ -716,6 +727,9 @@ impl<'h, 'b> Response<'h, 'b> {
         ));
         /* SAFETY: see `parse_headers_iter_uninit` guarantees */
         self.headers = unsafe { assume_init_slice(headers) };
+        self.version = Some(version);
+        self.code = Some(code);
+        self.reason = Some(reason);
         Ok(Status::Complete(len + headers_len))
     }
 }
@@ -1325,7 +1339,9 @@ pub fn parse_chunk_size(buf: &[u8])
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, Request, Response, Status, EMPTY_HEADER, parse_chunk_size};
+    use super::{
+        parse_chunk_size, Error, ParserConfig, Request, Response, Status, EMPTY_HEADER,
+    };
 
     const NUM_OF_HEADERS: usize = 4;
 
@@ -1746,16 +1762,14 @@ mod tests {
     }
 
     res! {
-        test_response_partial_parses_headers_as_much_as_it_can,
+        test_response_partial_does_not_publish_status,
         b"HTTP/1.1 200 OK\r\nServer: yolo\r\n",
         Ok(crate::Status::Partial),
         |res| {
-            assert_eq!(res.version.unwrap(), 1);
-            assert_eq!(res.code.unwrap(), 200);
-            assert_eq!(res.reason.unwrap(), "OK");
+            assert_eq!(res.version, None);
+            assert_eq!(res.code, None);
+            assert_eq!(res.reason, None);
             assert_eq!(res.headers.len(), NUM_OF_HEADERS); // doesn't slice since not Complete
-            assert_eq!(res.headers[0].name, "Server");
-            assert_eq!(res.headers[0].value, b"yolo");
         }
     }
 
@@ -1776,6 +1790,107 @@ mod tests {
             assert_eq!(res.headers[0].name, "Content-type");
             assert_eq!(res.headers[0].value, b"text/html");
         }
+    }
+
+    #[test]
+    fn response_status_is_published_only_once_complete() {
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nServer: yolo\r\n\r\n";
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut response = Response::new(&mut headers[..]);
+
+        for len in 0..RESPONSE.len() {
+            assert_eq!(
+                response.parse(&RESPONSE[..len]),
+                Ok(Status::Partial),
+                "prefix of {len} bytes should be partial"
+            );
+            assert_eq!(response.version, None, "version published at {len}");
+            assert_eq!(response.code, None, "code published at {len}");
+            assert_eq!(response.reason, None, "reason published at {len}");
+        }
+
+        assert_eq!(
+            response.parse(RESPONSE),
+            Ok(Status::Complete(RESPONSE.len()))
+        );
+        assert_eq!(response.version, Some(1));
+        assert_eq!(response.code, Some(200));
+        assert_eq!(response.reason, Some("OK"));
+        assert_eq!(response.headers.len(), 1);
+        assert_eq!(response.headers[0].name, "Server");
+        assert_eq!(response.headers[0].value, b"yolo");
+    }
+
+    #[test]
+    fn response_reason_whitespace_variants_parse_across_splits() {
+        let variants: &[(&[u8], &str, bool)] = &[
+            (b"HTTP/1.1 200 OK\r\n\r\n", "OK", false),
+            (b"HTTP/1.1 200 OK\n\n", "OK", false),
+            (b"HTTP/1.1 200\r\n\r\n", "", false),
+            (b"HTTP/1.1 200\n\n", "", false),
+            (b"HTTP/1.1 200 \r\n\r\n", "", false),
+            (b"HTTP/1.1   200  OK\r\n\r\n", "OK", true),
+            (b"HTTP/1.1  200\r\n\r\n", "", true),
+            (b"HTTP/1.1  200  \r\n\r\n", "", true),
+        ];
+
+        for &(input, reason, allow_multiple_spaces) in variants {
+            let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+            let mut response = Response::new(&mut headers[..]);
+            let mut config = ParserConfig::default();
+            config.allow_multiple_spaces_in_response_status_delimiters(allow_multiple_spaces);
+
+            for len in 0..input.len() {
+                assert_eq!(
+                    config.parse_response(&mut response, &input[..len]),
+                    Ok(Status::Partial),
+                    "prefix of {len} bytes of {input:?} should be partial"
+                );
+                assert_eq!(response.version, None);
+                assert_eq!(response.code, None);
+                assert_eq!(response.reason, None);
+            }
+
+            assert_eq!(
+                config.parse_response(&mut response, input),
+                Ok(Status::Complete(input.len())),
+                "input {input:?}"
+            );
+            assert_eq!(response.version, Some(1));
+            assert_eq!(response.code, Some(200));
+            assert_eq!(response.reason, Some(reason));
+            assert!(response.headers.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_response_does_not_leak_previous_status() {
+        const FIRST: &[u8] = b"HTTP/1.1 200 OK\r\nServer: yolo\r\n\r\n";
+        const BAD: &[u8] = b"HTTP/1.1 204 No Content\r\nBad Header\r\n\r\n";
+        const NEXT: &[u8] = b"HTTP/1.0 304\r\n\r\n";
+
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut response = Response::new(&mut headers[..]);
+
+        assert_eq!(
+            response.parse(FIRST),
+            Ok(Status::Complete(FIRST.len()))
+        );
+        assert_eq!(response.reason, Some("OK"));
+
+        assert_eq!(response.parse(BAD), Err(Error::HeaderName));
+        assert_eq!(response.version, None);
+        assert_eq!(response.code, None);
+        assert_eq!(response.reason, None);
+
+        assert_eq!(
+            response.parse(NEXT),
+            Ok(Status::Complete(NEXT.len()))
+        );
+        assert_eq!(response.version, Some(0));
+        assert_eq!(response.code, Some(304));
+        assert_eq!(response.reason, Some(""));
+        assert!(response.headers.is_empty());
     }
 
     /// Check all subset permutations of a partial request line with no headers
