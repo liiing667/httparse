@@ -435,6 +435,11 @@ impl ParserConfig {
 /// parse the associated property. This allows you to inspect the parts that
 /// could be parsed, before reading more, in case you wish to exit early.
 ///
+/// Calling [`Request::parse`] or [`ParserConfig::parse_request`] again first
+/// clears values from an earlier message. If parsing returns `Err`, the
+/// request-line fields are left as `None` rather than exposing either the
+/// previous request or an ambiguous prefix from the failed request.
+///
 /// # Example
 ///
 /// ```no_run
@@ -482,6 +487,32 @@ impl<'h, 'b> Request<'h, 'b> {
         &mut self,
         buf: &'b [u8],
         config: &ParserConfig,
+        headers: &'h mut [MaybeUninit<Header<'b>>],
+    ) -> Result<usize> {
+        // A reused parser must not expose fields from an earlier message
+        // before this buffer has supplied their replacement values.
+        self.method = None;
+        self.path = None;
+        self.version = None;
+
+        let result = self.parse_request_line_and_headers(buf, config, headers);
+
+        // A failed parse has no single, unambiguous request identity. In
+        // particular, do not leave an older path visible to callers that
+        // inspect `Request` after receiving `Err`.
+        if result.is_err() {
+            self.method = None;
+            self.path = None;
+            self.version = None;
+        }
+
+        result
+    }
+
+    fn parse_request_line_and_headers(
+        &mut self,
+        buf: &'b [u8],
+        config: &ParserConfig,
         mut headers: &'h mut [MaybeUninit<Header<'b>>],
     ) -> Result<usize> {
         let orig_len = buf.len();
@@ -492,7 +523,8 @@ impl<'h, 'b> Request<'h, 'b> {
         if config.allow_multiple_spaces_in_request_line_delimiters {
             complete!(skip_spaces(&mut bytes));
         }
-        self.path = Some(complete!(parse_uri(&mut bytes)));
+        let path = complete!(parse_uri(&mut bytes));
+        self.path = Some(path);
         if config.allow_multiple_spaces_in_request_line_delimiters {
             complete!(skip_spaces(&mut bytes));
         }
