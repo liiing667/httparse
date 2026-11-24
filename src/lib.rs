@@ -435,6 +435,14 @@ impl ParserConfig {
 /// parse the associated property. This allows you to inspect the parts that
 /// could be parsed, before reading more, in case you wish to exit early.
 ///
+/// The method, path, and version are published together only once the complete
+/// request line has been parsed. If the method token or the HTTP version is
+/// truncated, all three remain `None`; this prevents callers, such as reverse
+/// proxies building routing keys, from acting on part of a request line that
+/// may be completed differently by another HTTP implementation. A parse that
+/// returns an [`Error`] clears these fields as well, so a reused `Request`
+/// never exposes values from an earlier message.
+///
 /// # Example
 ///
 /// ```no_run
@@ -478,29 +486,46 @@ impl<'h, 'b> Request<'h, 'b> {
         }
     }
 
+    /// Publish a fully parsed request line in one step.
+    ///
+    /// Keeping the assignments together makes it impossible for callers to
+    /// observe a method or path from a request line whose version has not been
+    /// parsed yet.
+    fn publish_request_line(&mut self, method: &'b str, path: &'b str, version: u8) {
+        self.method = Some(method);
+        self.path = Some(path);
+        self.version = Some(version);
+    }
+
     fn parse_with_config_and_uninit_headers(
         &mut self,
         buf: &'b [u8],
         config: &ParserConfig,
         mut headers: &'h mut [MaybeUninit<Header<'b>>],
     ) -> Result<usize> {
+        // Drop anything left over from a previous parse before touching the
+        // new buffer. A caller that reuses a `Request` must never observe
+        // fields belonging to a different message.
+        self.method = None;
+        self.path = None;
+        self.version = None;
+
         let orig_len = buf.len();
         let mut bytes = Bytes::new(buf);
         complete!(skip_empty_lines(&mut bytes));
         let method = complete!(parse_method(&mut bytes));
-        self.method = Some(method);
         if config.allow_multiple_spaces_in_request_line_delimiters {
             complete!(skip_spaces(&mut bytes));
         }
-        self.path = Some(complete!(parse_uri(&mut bytes)));
+        let path = complete!(parse_uri(&mut bytes));
         if config.allow_multiple_spaces_in_request_line_delimiters {
             complete!(skip_spaces(&mut bytes));
         }
-        self.version = Some(complete!(parse_version(&mut bytes)));
+        let version = complete!(parse_version(&mut bytes));
         newline!(bytes);
 
         let len = orig_len - bytes.len();
-        let headers_len = complete!(parse_headers_iter_uninit(
+        match parse_headers_iter_uninit(
             &mut headers,
             &mut bytes,
             &HeaderParserConfig {
@@ -509,11 +534,28 @@ impl<'h, 'b> Request<'h, 'b> {
                 allow_space_before_first_header_name: config.allow_space_before_first_header_name,
                 ignore_invalid_headers: config.ignore_invalid_headers_in_requests
             },
-        ));
-        /* SAFETY: see `parse_headers_iter_uninit` guarantees */
-        self.headers = unsafe { assume_init_slice(headers) };
-
-        Ok(Status::Complete(len + headers_len))
+        ) {
+            Ok(Status::Complete(headers_len)) => {
+                // The request line is complete and valid, so it is safe to
+                // publish it together with the parsed headers.
+                self.publish_request_line(method, path, version);
+                /* SAFETY: see `parse_headers_iter_uninit` guarantees */
+                self.headers = unsafe { assume_init_slice(headers) };
+                Ok(Status::Complete(len + headers_len))
+            }
+            Ok(Status::Partial) => {
+                // The request line is complete; expose it so callers can make
+                // decisions while waiting for the rest of the headers. Do not
+                // publish a partially parsed request line, though: a routing
+                // key must not be built from a truncated method or version.
+                self.publish_request_line(method, path, version);
+                Ok(Status::Partial)
+            }
+            // A malformed header invalidates the whole message. Leave the
+            // fields cleared so a reused `Request` cannot leak data from this
+            // message or a previous one.
+            Err(err) => Err(err),
+        }
     }
 
     /// Try to parse a buffer of bytes into the Request,
@@ -1530,6 +1572,118 @@ mod tests {
         test_request_partial_version,
         b"GET / HTTP/1.", Ok(Status::Partial),
         |_req| {}
+    }
+
+    #[test]
+    fn test_request_partial_method_does_not_publish_fields() {
+        for buf in [&b"G"[..], b"GE", b"PATCH", b"GET "] {
+            let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+            let mut req = Request::new(&mut headers[..]);
+
+            assert_eq!(req.parse(buf), Ok(Status::Partial));
+            assert_eq!(req.method, None);
+            assert_eq!(req.path, None);
+            assert_eq!(req.version, None);
+        }
+    }
+
+    #[test]
+    fn test_request_partial_version_does_not_publish_fields() {
+        for buf in [&b"GET / HTT"[..], b"GET / HTTP/1.", b"PATCH / HTTP/1"] {
+            let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+            let mut req = Request::new(&mut headers[..]);
+
+            assert_eq!(req.parse(buf), Ok(Status::Partial));
+            assert_eq!(req.method, None);
+            assert_eq!(req.path, None);
+            assert_eq!(req.version, None);
+        }
+    }
+
+    #[test]
+    fn test_request_failure_clears_fields_from_previous_parse() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+
+        assert!(req
+            .parse(b"GET /old HTTP/1.1\r\nHost: old\r\n\r\n")
+            .unwrap()
+            .is_complete());
+        assert_eq!(req.method, Some("GET"));
+        assert_eq!(req.path, Some("/old"));
+        assert_eq!(req.version, Some(1));
+
+        // A truncated request line must not expose the previous request.
+        assert_eq!(req.parse(b"POST /new HTTP/1."), Ok(Status::Partial));
+        assert_eq!(req.method, None);
+        assert_eq!(req.path, None);
+        assert_eq!(req.version, None);
+
+        // The same holds when a new method token is itself truncated.
+        assert!(req
+            .parse(b"DELETE /again HTTP/1.1\r\n\r\n")
+            .unwrap()
+            .is_complete());
+        assert_eq!(req.parse(b"GE"), Ok(Status::Partial));
+        assert_eq!(req.method, None);
+        assert_eq!(req.path, None);
+        assert_eq!(req.version, None);
+    }
+
+    #[test]
+    fn test_request_header_error_clears_current_request_line() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+
+        assert_eq!(
+            req.parse(b"POST /new HTTP/1.1\r\nBad Header\r\n\r\n"),
+            Err(Error::HeaderName)
+        );
+        assert_eq!(req.method, None);
+        assert_eq!(req.path, None);
+        assert_eq!(req.version, None);
+    }
+
+    #[test]
+    fn test_request_partial_headers_publishes_current_request_line() {
+        let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+        let mut req = Request::new(&mut headers[..]);
+
+        assert!(req
+            .parse(b"GET /old HTTP/1.0\r\nHost: old\r\n\r\n")
+            .unwrap()
+            .is_complete());
+
+        assert_eq!(
+            req.parse(b"DELETE /new HTTP/1.1\r\nHost: new\r\n"),
+            Ok(Status::Partial)
+        );
+        assert_eq!(req.method, Some("DELETE"));
+        assert_eq!(req.path, Some("/new"));
+        assert_eq!(req.version, Some(1));
+    }
+
+    #[test]
+    fn test_common_methods_and_http_1x_requests_remain_supported() {
+        for method in [
+            "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD", "CONNECT", "TRACE",
+            "PURGE", "M-SEARCH",
+        ] {
+            for (version, minor) in [("HTTP/1.0", 0), ("HTTP/1.1", 1)] {
+                let buf = format!("{method} /resource {version}\r\nHost: example.com\r\n\r\n");
+                let mut headers = [EMPTY_HEADER; NUM_OF_HEADERS];
+                let mut req = Request::new(&mut headers[..]);
+
+                assert_eq!(
+                    req.parse(buf.as_bytes()),
+                    Ok(Status::Complete(buf.len())),
+                    "expected {method} {version} to parse"
+                );
+                assert_eq!(req.method, Some(method));
+                assert_eq!(req.path, Some("/resource"));
+                assert_eq!(req.version, Some(minor));
+            }
+        }
     }
 
     req! {
